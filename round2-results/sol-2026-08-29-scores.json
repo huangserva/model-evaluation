@@ -1,0 +1,181 @@
+{
+  "protocol": {
+    "id": "gpt-5.6-sol-round2-public-v1",
+    "evaluation_date": "2026-08-29",
+    "target_model": "GPT-5.6 Sol",
+    "service_model_alias": "gpt-5.6-sol",
+    "dimensions": 10,
+    "runs_per_dimension": 3,
+    "evaluation_units": 30,
+    "unit_definition": "one frozen dimension prompt multiplied by one independent run",
+    "per_model_question_count": 10,
+    "requested_preset": "Ultra",
+    "wire_reasoning_effort": "max",
+    "closed_book": true,
+    "delegation_disabled": true,
+    "sampling_controls_exposed": {
+      "temperature": false,
+      "seed": false,
+      "max_output": false
+    },
+    "explicit_output_cap_accepted": false,
+    "immutable_backend_snapshot_verified": false,
+    "aggregation": {
+      "profile": "sum of the ten per-dimension medians",
+      "dimension": "median of three runs; range is minimum to maximum",
+      "whole_run": "sum of the ten scores sharing the same run index",
+      "service_failure": "excluded and represented as null",
+      "invalid_model_output": "included as zero"
+    },
+    "speed_scored": false,
+    "comparison_limit": "This append-only batch used a different independent judge from the old leaderboard; small score gaps do not support precise ordering."
+  },
+  "profile_score": 95.2,
+  "dimensions": {
+    "D1": {
+      "scores": [
+        10,
+        10,
+        10
+      ],
+      "median": 10,
+      "range": [
+        10,
+        10
+      ]
+    },
+    "D2": {
+      "scores": [
+        9.6,
+        9.6,
+        10
+      ],
+      "median": 9.6,
+      "range": [
+        9.6,
+        10
+      ]
+    },
+    "D3": {
+      "scores": [
+        9.6,
+        9.6,
+        10
+      ],
+      "median": 9.6,
+      "range": [
+        9.6,
+        10
+      ]
+    },
+    "D4": {
+      "scores": [
+        10,
+        10,
+        10
+      ],
+      "median": 10,
+      "range": [
+        10,
+        10
+      ]
+    },
+    "D5": {
+      "scores": [
+        9.6,
+        10,
+        9.6
+      ],
+      "median": 9.6,
+      "range": [
+        9.6,
+        10
+      ]
+    },
+    "D6": {
+      "scores": [
+        10,
+        9.6,
+        9.6
+      ],
+      "median": 9.6,
+      "range": [
+        9.6,
+        10
+      ]
+    },
+    "D7": {
+      "scores": [
+        8.8,
+        8.4,
+        8.4
+      ],
+      "median": 8.4,
+      "range": [
+        8.4,
+        8.8
+      ]
+    },
+    "D8": {
+      "scores": [
+        9.6,
+        9.6,
+        10
+      ],
+      "median": 9.6,
+      "range": [
+        9.6,
+        10
+      ]
+    },
+    "D9": {
+      "scores": [
+        9.2,
+        9.6,
+        8.8
+      ],
+      "median": 9.2,
+      "range": [
+        8.8,
+        9.6
+      ]
+    },
+    "D10": {
+      "scores": [
+        10,
+        9.2,
+        9.6
+      ],
+      "median": 9.6,
+      "range": [
+        9.2,
+        10
+      ]
+    }
+  },
+  "whole_run_scores": [
+    96.4,
+    95.6,
+    96
+  ],
+  "status_counts": {
+    "complete": 30,
+    "partial": 0,
+    "empty": 0,
+    "tool_call": 0,
+    "protocol_invalid": 0,
+    "service_failure": 0
+  },
+  "b0_cells": [],
+  "judge": {
+    "model": "Claude Fable 5",
+    "requested_preset": "Max",
+    "transport": "Claude Desktop Chat",
+    "incognito": true,
+    "selection_evidence": "desktop UI selection; no provider model echo",
+    "tools_observed": false,
+    "cli_403_failures_counted_as_judgments": false,
+    "independent": true,
+    "rubric_sha256": "083fee4b32835fc32b36901c494c1581e3c358554b7aa9632bd0c4119838bc5c"
+  }
+}
