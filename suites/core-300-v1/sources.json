@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "sources": {
+    "humanevalplus": {
+      "repo_id": "evalplus/humanevalplus",
+      "repo_type": "dataset",
+      "revision": "d32357cf319e50e9c8d8dab5ea876c72b0fd321b",
+      "license": "apache-2.0",
+      "split": "test",
+      "filename": "data/test-00000-of-00001-5973903632b82d40.parquet",
+      "raw_sha256": "4436f5c03d77c17e0cbc57543b90665b5c1266f55a43992a5ed7922cd34a7558",
+      "rows": 164,
+      "evalplus_dataset": "humaneval",
+      "evalplus_release": {
+        "version": "v0.1.10",
+        "url": "https://github.com/evalplus/humanevalplus_release/releases/download/v0.1.10/HumanEvalPlus.jsonl.gz",
+        "filename": "HumanEvalPlus-v0.1.10.jsonl.gz",
+        "sha256": "272720b90ac375502c8ed23cd791c2a93dfb22a911641a494da74a426c09f101"
+      }
+    },
+    "mbppplus": {
+      "repo_id": "evalplus/mbppplus",
+      "repo_type": "dataset",
+      "revision": "b2d74c91837c3f2a20c1299ae98133cbe7cfa077",
+      "license": "apache-2.0",
+      "split": "test",
+      "filename": "data/test-00000-of-00001-d5781c9c51e02795.parquet",
+      "raw_sha256": "dc20030b3788fccf617444edcb34138ef13d7e4fafd17bfcb8c1279dbb12399b",
+      "rows": 378,
+      "evalplus_dataset": "mbpp",
+      "evalplus_release": {
+        "version": "v0.2.0",
+        "url": "https://github.com/evalplus/mbppplus_release/releases/download/v0.2.0/MbppPlus.jsonl.gz",
+        "filename": "MbppPlus-v0.2.0.jsonl.gz",
+        "sha256": "af43697e8791c4c149bdfd6b489d8b5412507551ac20e28a439f650b8225db63"
+      }
+    },
+    "mmlu_pro": {
+      "repo_id": "TIGER-Lab/MMLU-Pro",
+      "repo_type": "dataset",
+      "revision": "b189ec765aa7ed75c8acfea42df31fdae71f97be",
+      "license": "mit",
+      "split": "test",
+      "filename": "data/test-00000-of-00001.parquet",
+      "raw_sha256": "0e24a191921c2f453518a537a8b2117bd137e7714d4ef1565e9ba06c1ecb9ad8",
+      "rows": 12032
+    }
+  },
+  "evaluator": {
+    "repo": "https://github.com/evalplus/evalplus.git",
+    "revision": "26d6d00bb1fd0fa37f39c99d5290da67891d1c5e",
+    "license": "apache-2.0"
+  }
+}
