@@ -68,9 +68,10 @@ You are participating in a closed-book capability evaluation.
 
 ## 二、每模型 300 题代码与困难推理基准
 
-这是已经完成的历史实测快照：每个参测模型配置都运行同一批 300 题，包含 75 题 HumanEval+、75 题 MBPP+ 和 150 题 MMLU-Pro。HumanEval+ 与 MBPP+ 是 Python 代码题库，MMLU-Pro 是多学科困难选择题题库。仓库公开确切题目清单、上游固定版本、题面重建脚本、运行协议和汇总结果；不公开答案与模型原始输出，也不声称提供完整推理运行器。
+这是已经完成的历史实测快照：每个参测模型配置都运行同一批 300 题。题目包括 75 题 HumanEval Plus（HumanEval 增强版，HumanEval+）Python 函数生成基准、75 题 Mostly Basic Python Problems Plus（基础 Python 编程题增强版，MBPP+），以及 150 题 Massive Multitask Language Understanding Pro（多学科语言理解专业难度版，MMLU-Pro）选择题推理基准；两个加号都表示增加了更强测试，Pro 表示更困难的增强版本。当前结果包含四个采用冻结本地推理协议的配置，以及一个腾讯 WorkBuddy 渠道扩展对照。扩展对照使用 WorkBuddy 显示的预览模型别名 Hy4 Preview；名称中数字 4 的含义平台没有披露，不能把它当作已验证的固定版本号。该入口与本地基线使用同一批题、逐字相同的用户提示词和同一评分器，但平台系统上下文及部分推理参数不同，因此单独报告。仓库公开确切题目清单、上游固定版本、题面重建脚本、运行协议和汇总结果；不公开答案与模型原始输出，也不声称提供完整推理运行器。
 
 - [题集说明与题面重建命令](./suites/core-300-v1/README.md)
 - [300 条公开清单](./suites/core-300-v1/manifest.jsonl)
 - [运行与评分协议](./suites/core-300-v1/protocol.md)
 - [已完成结果](./suites/core-300-v1/results.md)
+- [Hy4 Preview × WorkBuddy 300 题结果卡](./suites/core-300-v1/hy4-workbuddy-2026-08-29.md)
