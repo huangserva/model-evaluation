@@ -1,0 +1,26 @@
+From c9aaec66b81321c9d77307c3603816468d5fdde5 Mon Sep 17 00:00:00 2001
+From: huangserva <huangserva@gmail.com>
+Date: Sat, 26 Sep 2026 14:42:19 +0800
+Subject: [PATCH 11/11] tp2_proxy: per-deployment mailbox file next to the
+ lockstep file
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/tp2/tp2_proxy.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/tools/tp2/tp2_proxy.py b/tools/tp2/tp2_proxy.py
+index c92692f..f7cbebd 100644
+--- a/tools/tp2/tp2_proxy.py
++++ b/tools/tp2/tp2_proxy.py
+@@ -45,6 +45,7 @@ class Supervisor:
+                     "NINFER_TP_ID_FILE": self.args.id_file,
+                     "NINFER_TP_LOCKSTEP_FILE": self.args.lockstep_file,
+                     "NINFER_TP_LOCKSTEP_TIMEOUT_S": str(self.args.lockstep_timeout),
++                    "NINFER_TP_MAILBOX_FILE": self.args.lockstep_file + ".mailbox",
+                     "NCCL_P2P_DISABLE": "1"})
+         if r == 1:
+             for kv in self.args.rank1_env:   # test hooks only
+-- 
+2.43.0
+

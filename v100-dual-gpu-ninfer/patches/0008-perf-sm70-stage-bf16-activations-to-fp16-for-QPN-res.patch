@@ -1,0 +1,246 @@
+From 2779a3794c93559e544d4ea4a1f62f226067b8f5 Mon Sep 17 00:00:00 2001
+From: huangserva <huangserva@gmail.com>
+Date: Sat, 26 Sep 2026 10:46:43 +0800
+Subject: [PATCH 08/11] perf(sm70): stage bf16 activations to fp16 for QPN
+ residual/down projections
+
+The FP8 linear_add QPN route and the NVFP4 linear QPN chunks fed bf16
+activations straight into the kernel, which converts 8 values per
+16-byte activation load in its inner loop. The attention/GDN input
+projections and the SwiGLU halves already staged to fp16; the residual
+projections did not and ran at ~350 GB/s.
+
+Stage once into workspace (exact-size workspace queries, fallback to the
+old path when the arena has no room):
+  NVFP4 5120x17408 T=4 (single-card down)   151.5 -> 94.2 us
+  NVFP4 5120x8704  T=4 (TP2 down)            80.9 -> 57.3 us
+  FP8   5120x3072  T=4 (TP2 out proj)        42.8 -> 29.4 us (lab)
+TP2 end to end: 186K code 82.4 -> 86.7 tok/s, 193K zh 63.7 -> 67.0,
+8K code 112.9 -> 121.0.
+
+linear_bench: NINFER_BENCH_PREPACK=1 prepacks FP8/NVFP4 like the loader.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bench/ops/linear_bench.cu                     | 12 ++++++++
+ src/ops/linear/nvfp4/nvfp4_dispatch.cpp       | 28 ++++++++++++++++++-
+ src/ops/linear/nvfp4/nvfp4_launch.h           |  3 ++
+ src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu  | 10 +++++++
+ .../linear_add/fp8/fp8_linear_add_decode.cu   |  7 +++++
+ .../linear_add/fp8/fp8_linear_add_plan.cpp    | 21 ++++++++++++--
+ src/ops/linear_add/fp8/fp8_linear_add_plan.h  |  5 ++++
+ 7 files changed, 83 insertions(+), 3 deletions(-)
+
+diff --git a/bench/ops/linear_bench.cu b/bench/ops/linear_bench.cu
+index e22ca00..f50ac40 100644
+--- a/bench/ops/linear_bench.cu
++++ b/bench/ops/linear_bench.cu
+@@ -9,6 +9,10 @@
+ //       --qtype q4 --n 4096 --k 5120 --t 8 --profile
+ 
+ #include "ninfer/ops/linear.h"
++#ifdef NINFER_VOLTA_BUILD
++#include "ops/linear/fp8/fp8_prepack_sm70.h"
++#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
++#endif
+ 
+ #include "core/device.h"
+ #include "direct_bf16_weight.cuh"
+@@ -650,6 +654,14 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
+         checked_mul(static_cast<std::uint64_t>(group.n), max_t, "output allocation");
+ 
+     LinearBenchWeight weight = make_weight(group.qtype, group.n, group.k);
++#ifdef NINFER_VOLTA_BUILD
++    // NINFER_BENCH_PREPACK=1 mirrors the model loader: FP8/NVFP4 weights are QPN-prepacked.
++    if (const char* pp = std::getenv("NINFER_BENCH_PREPACK"); pp != nullptr && pp[0] == '1') {
++        if (group.qtype == QType::FP8_E4M3FN_ROW_BF16S) { ops::detail::fp8_prepack_qpn_sm70(weight.weight); }
++        if (group.qtype == QType::NVFP4) { ops::detail::nvfp4_prepack_qpn_sm70(weight.weight); }
++        CUDA_CHECK(cudaDeviceSynchronize());
++    }
++#endif
+     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
+     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
+     const std::size_t workspace_capacity = ops::linear_workspace_capacity_bytes(
+diff --git a/src/ops/linear/nvfp4/nvfp4_dispatch.cpp b/src/ops/linear/nvfp4/nvfp4_dispatch.cpp
+index f5a507c..3847628 100644
+--- a/src/ops/linear/nvfp4/nvfp4_dispatch.cpp
++++ b/src/ops/linear/nvfp4/nvfp4_dispatch.cpp
+@@ -4,6 +4,9 @@
+ #include "ops/linear/nvfp4/nvfp4_format.h"
+ #include "ops/linear/nvfp4/nvfp4_launch.h"
+ #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
++#ifdef NINFER_VOLTA_BUILD
++#include "ops/linear/fp8/fp8_launch.h" // fp8_stage_bf16_activation_sm70 (plain bf16 -> fp16)
++#endif
+ 
+ #include <algorithm>
+ #include <cstdint>
+@@ -82,6 +85,20 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
+         Tensor output_chunk(output, DType::BF16, {weight.n, active});
+ #ifdef NINFER_VOLTA_BUILD
+         if (nvfp4_volta_qpn_supported(weight.n, weight.k, active)) {
++            // Staging the activation to fp16 takes the per-load bf16 conversions out of the
++            // kernel's inner loop: 5120x17408 T=4 102 us instead of 155 us.
++            const std::size_t stage_bytes =
++                static_cast<std::size_t>(weight.k) * static_cast<std::size_t>(active) * 2;
++            const std::size_t aligned_used =
++                workspace != nullptr ? (workspace->used() + 255) / 256 * 256 : 0;
++            if (workspace != nullptr && workspace->capacity() >= aligned_used &&
++                workspace->capacity() - aligned_used >= stage_bytes) {
++                auto scope             = workspace->scope();
++                const DeviceSpan stage = workspace->alloc_bytes(stage_bytes, 256);
++                fp8_stage_bf16_activation_sm70(input_chunk, stage.data, stream);
++                launch_nvfp4_volta_qpn_fp16(input_chunk, stage.data, weight, output_chunk, stream);
++                continue;
++            }
+             launch_nvfp4_volta_qpn(input_chunk, weight, output_chunk, stream);
+             continue;
+         }
+@@ -107,14 +124,23 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
+         return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
+     }
+ #ifdef NINFER_VOLTA_BUILD
++    // fp16 activation staging for the QPN chunks (<= kNvfp4VoltaQpnMaxTokens tokens each).
++    const std::size_t qpn_stage_bytes =
++        policy == LinearPolicy::A16Only
++            ? (static_cast<std::size_t>(input_rows) *
++                       static_cast<std::size_t>(std::min(max_tokens, kNvfp4VoltaQpnMaxTokens)) * 2 +
++                   255) / 256 * 256
++            : 0;
+     // The wide-T MMA route in launch_a16 only needs workspace when split-K applies; report that
+     // so a caller sizing for the widest T this interval reaches has it available. A caller that
+     // doesn't (the zero-workspace linear() overload) still works -- launch_a16 falls back to the
+     // chunked route rather than fault.
+     if (policy == LinearPolicy::A16Only && max_tokens > kNvfp4VoltaQpnMaxTokens &&
+         nvfp4_volta_mma_supported(output_rows, input_rows, max_tokens)) {
+-        return nvfp4_volta_mma_workspace_bytes(output_rows, input_rows, max_tokens);
++        return std::max(nvfp4_volta_mma_workspace_bytes(output_rows, input_rows, max_tokens),
++                        qpn_stage_bytes);
+     }
++    return qpn_stage_bytes;
+ #endif
+     return 0;
+ }
+diff --git a/src/ops/linear/nvfp4/nvfp4_launch.h b/src/ops/linear/nvfp4/nvfp4_launch.h
+index 28041b7..a135a16 100644
+--- a/src/ops/linear/nvfp4/nvfp4_launch.h
++++ b/src/ops/linear/nvfp4/nvfp4_launch.h
+@@ -20,6 +20,9 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
+ inline constexpr std::int32_t kNvfp4VoltaQpnRowsPerTile = 8;
+ inline constexpr std::int32_t kNvfp4VoltaQpnMaxTokens   = 32;
+ void launch_nvfp4_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t);
++// x_fp16: the same activation pre-staged to fp16 (see fp8_stage_bf16_activation_sm70).
++void launch_nvfp4_volta_qpn_fp16(const Tensor& x, const void* x_fp16, const Weight&, Tensor&,
++                                 cudaStream_t);
+ [[nodiscard]] bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k,
+                                              std::int32_t t) noexcept;
+ 
+diff --git a/src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu b/src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
+index abe0b14..be1e390 100644
+--- a/src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
++++ b/src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
+@@ -36,6 +36,16 @@ void launch_nvfp4_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaS
+         inverse_weight_divisor, stream);
+ }
+ 
++void launch_nvfp4_volta_qpn_fp16(const Tensor& x, const void* x_fp16, const Weight& w, Tensor& out,
++                                 cudaStream_t stream) {
++    const std::int32_t n                   = out.ne[0];
++    const float inverse_weight_divisor = 1.0F / w.weight_scale_divisor;
++    launch_nvfp4_volta_qpn_with_fp16_activation(
++        x, w, static_cast<const half*>(x_fp16),
++        Nvfp4ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), n}, n,
++        inverse_weight_divisor, stream);
++}
++
+ #endif // NINFER_VOLTA_BUILD
+ 
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/linear_add/fp8/fp8_linear_add_decode.cu b/src/ops/linear_add/fp8/fp8_linear_add_decode.cu
+index 81905fa..7466aec 100644
+--- a/src/ops/linear_add/fp8/fp8_linear_add_decode.cu
++++ b/src/ops/linear_add/fp8/fp8_linear_add_decode.cu
+@@ -58,6 +58,13 @@ void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& re
+         x, weight,
+         Fp8ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), weight.n}, weight.n, stream);
+ }
++
++void fp8_linear_add_qpn_fp16_launch(const Tensor& x, const void* x_fp16, const Weight& weight,
++                                    Tensor& residual, cudaStream_t stream) {
++    launch_fp8_volta_qpn_with_fp16_activation(
++        x, weight, static_cast<const half*>(x_fp16),
++        Fp8ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), weight.n}, weight.n, stream);
++}
+ #endif
+ 
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/linear_add/fp8/fp8_linear_add_plan.cpp b/src/ops/linear_add/fp8/fp8_linear_add_plan.cpp
+index 329aad8..7eebd2d 100644
+--- a/src/ops/linear_add/fp8/fp8_linear_add_plan.cpp
++++ b/src/ops/linear_add/fp8/fp8_linear_add_plan.cpp
+@@ -7,6 +7,7 @@
+ #include "ops/linear/fp8/fp8_config.h"
+ #ifdef NINFER_VOLTA_BUILD
+ #include "ops/linear/fp8/fp8_cutlass_sm70.h"
++#include "ops/linear/fp8/fp8_launch.h"
+ #endif
+ 
+ #include <algorithm>
+@@ -82,6 +83,16 @@ Tensor allocate_projected(Allocator& allocator, std::int32_t output_rows, std::i
+ void launch_qpn_residual(const Tensor& x, const Weight& weight, Tensor& residual,
+                          WorkspaceArena& workspace, cudaStream_t stream) {
+     if (x.ne[1] <= 32) {
++        const std::size_t stage_bytes =
++            static_cast<std::size_t>(x.ne[0]) * static_cast<std::size_t>(x.ne[1]) * 2;
++        const std::size_t aligned_used = (workspace.used() + 255) / 256 * 256;
++        if (workspace.capacity() >= aligned_used && workspace.capacity() - aligned_used >= stage_bytes) {
++            auto scope             = workspace.scope();
++            const DeviceSpan stage = workspace.alloc_bytes(stage_bytes, 256);
++            fp8_stage_bf16_activation_sm70(x, stage.data, stream);
++            fp8_linear_add_qpn_fp16_launch(x, stage.data, weight, residual, stream);
++            return;
++        }
+         fp8_linear_add_qpn_launch(x, weight, residual, stream);
+         return;
+     }
+@@ -93,13 +104,19 @@ void launch_qpn_residual(const Tensor& x, const Weight& weight, Tensor& residual
+ 
+ std::size_t qpn_residual_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
+                                          std::int32_t tokens) {
++    // fp16 staging of the activation for the QPN route (T <= 32).
++    WorkspaceLayoutBuilder stage_layout;
++    (void)stage_layout.alloc_bytes(
++        static_cast<std::size_t>(input_rows) * static_cast<std::size_t>(std::min(tokens, 32)) * 2,
++        256);
++    const std::size_t stage_bytes = stage_layout.peak_bytes(1);
+     WorkspaceLayoutBuilder layout;
+-    if (tokens <= 32) { return 0; }
++    if (tokens <= 32) { return stage_bytes; }
+     (void)allocate_projected(layout, output_rows, tokens);
+     const std::size_t linear_bytes =
+         fp8_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens);
+     (void)layout.alloc_bytes(linear_bytes, 256);
+-    return layout.peak_bytes(1);
++    return std::max(layout.peak_bytes(1), stage_bytes);
+ }
+ #endif
+ 
+diff --git a/src/ops/linear_add/fp8/fp8_linear_add_plan.h b/src/ops/linear_add/fp8/fp8_linear_add_plan.h
+index ab951c3..62ffa38 100644
+--- a/src/ops/linear_add/fp8/fp8_linear_add_plan.h
++++ b/src/ops/linear_add/fp8/fp8_linear_add_plan.h
+@@ -26,6 +26,11 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
+ #ifdef NINFER_VOLTA_BUILD
+ void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                cudaStream_t stream);
++// Same as fp8_linear_add_qpn_launch with the activation pre-staged to fp16 (x_fp16 holds
++// x.ne[0] * x.ne[1] halves). Converting inside the kernel costs 8 cvt per 16-byte activation
++// load and made the residual shapes run at ~360 GB/s instead of ~530.
++void fp8_linear_add_qpn_fp16_launch(const Tensor& x, const void* x_fp16, const Weight& weight,
++                                    Tensor& residual, cudaStream_t stream);
+ #endif
+ 
+ void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
+-- 
+2.43.0
+

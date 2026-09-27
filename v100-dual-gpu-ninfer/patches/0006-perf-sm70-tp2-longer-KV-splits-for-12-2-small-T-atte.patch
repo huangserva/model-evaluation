@@ -1,0 +1,47 @@
+From 8fac611375a45f22aabc08f2ef80338a445d6de1 Mon Sep 17 00:00:00 2001
+From: huangserva <huangserva@gmail.com>
+Date: Sat, 26 Sep 2026 08:57:27 +0800
+Subject: [PATCH 06/11] perf(sm70/tp2): longer KV splits for 12/2 small-T
+ attention
+
+The split grid is sized for the envelope maximum (241664 keys), so the
+480/scale long-window tier gave ~1000 splits of ~185 live keys at 186K and
+the partial-output reduce dominated. 12/2 now targets 1920 keys per split;
+NINFER_SM70_LONG_SPLIT_KEYS overrides for tuning.
+
+Kernel (T=4, 186K): 932 -> 662 us. End to end TP2: 186K code
+70.1 -> 82.4 tok/s, 193K zh 56.9 -> 63.7.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../dense/causal_cache/small_t.cu                  | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t.cu b/src/ops/softmax_attention/dense/causal_cache/small_t.cu
+index e777bff..27fdd6d 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t.cu
+@@ -44,7 +44,19 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
+     include_tier(4096, 64 / Geometry::SmallTSplitScale);
+     if (window > 4096) { include_tier(8198, 128 / Geometry::SmallTSplitScale); }
+     if (window > 8198) { include_tier(16390, 256 / Geometry::SmallTSplitScale); }
+-    if (window > 16390) { include_tier(window, 480 / Geometry::SmallTSplitScale); }
++    if (window > 16390) {
++        // Tuning hook: NINFER_SM70_LONG_SPLIT_KEYS overrides the long-window keys per split.
++        static const std::int32_t long_keys = [] {
++            const char* v = std::getenv("NINFER_SM70_LONG_SPLIT_KEYS");
++            return v != nullptr ? std::atoi(v) : 0;
++        }();
++        // The TP2 12/2 shard halves the work per split; at the 480/scale default a 241664-key
++        // envelope gives ~1000 splits of ~185 live keys at 186K and the reduce dominates.
++        // 1920 keys measured 932 -> 662 us (T=4, 186K) and plateaus from 1440 up.
++        constexpr std::int32_t kDefaultLongKeys =
++            Geometry::QHeads == 12 ? 1920 : 480 / Geometry::SmallTSplitScale;
++        include_tier(window, long_keys > 0 ? long_keys : kDefaultLongKeys);
++    }
+ 
+     return (splits < Geometry::SmallTMaximumSplits) ? splits : Geometry::SmallTMaximumSplits;
+ }
+-- 
+2.43.0
+

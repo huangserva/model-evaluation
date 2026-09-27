@@ -1,0 +1,415 @@
+From 9dbb10eb10f4c7972667d574d00361639979bc50 Mon Sep 17 00:00:00 2001
+From: huangserva <huangserva@gmail.com>
+Date: Sat, 26 Sep 2026 14:02:29 +0800
+Subject: [PATCH 10/11] perf(sm70/tp2): fused NVFP4 residual epilogue, faster
+ split reduce, MTP key window knob
+
+- NVFP4 linear_add at decode widths: fp16-staged activation and residual
+  add fused into the QPN epilogue (no projected temporary, no separate
+  residual_add, one BF16 round). TP2 rank 1 writes its down-projection
+  partial directly at T <= 32 instead of memset + linear_add.
+- small-T split reduce: the idle 3/4 of the 256 threads (DChunk 64 for
+  12/2) now share the split loop, branch-free and unrolled x8: 29 -> 13 us
+  (T=4), 21 -> 9 us (T=1).
+- NINFER_MTP_ATTN_WINDOW=W (default off): MTP draft attention over the last
+  W keys only. Saves ~1.3 ms/round at 193K but code acceptance drops
+  0.72 -> 0.59-0.63 (long-range structure), so it is not enabled.
+
+TP2 e2e (256 tokens, temp 0.7): 186K code 100.4 tok/s, 193K zh 80.5
+(acceptance 0.54 this sample; per round 32.5 ms), 8K code 140.2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/ninfer/ops/softmax_attention.h        |  7 +++
+ src/ops/linear/nvfp4/nvfp4_launch.h           |  3 ++
+ src/ops/linear/nvfp4/nvfp4_output.cuh         | 12 +++++
+ src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu  | 10 ++++
+ .../nvfp4/nvfp4_linear_add_plan.cpp           | 22 ++++++++
+ .../dense/causal_cache/small_t.cu             | 16 ++++--
+ .../dense/causal_cache/small_t.cuh            | 38 +++++++++++--
+ .../causal_cache/small_t_i8_volta_v2.cuh      | 12 +++--
+ .../qwen3_6/impl/runtime/text_context_impl.h  | 18 +++++++
+ src/targets/qwen3_6_27b_tp2/impl/tp2_comm.cpp | 54 +++++++++++--------
+ src/targets/qwen3_6_27b_tp2/impl/variant.cpp  | 13 +++--
+ 11 files changed, 169 insertions(+), 36 deletions(-)
+
+diff --git a/include/ninfer/ops/softmax_attention.h b/include/ninfer/ops/softmax_attention.h
+index 77e9931..805977e 100644
+--- a/include/ninfer/ops/softmax_attention.h
++++ b/include/ninfer/ops/softmax_attention.h
+@@ -199,4 +199,11 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
+     AttentionHeadGeometry geometry, ContextAttentionExecutionEnvelope envelope,
+     std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t batch_size);
+ 
++// Draft-side key window for the small-T int8 attention (MTP layer): while a window W > 0 is set on
++// the calling thread, kernels launched by causal_softmax_attention only attend to the last W keys
++// (rounded down to a 64-key tile). The target model's own attention never sets it, so outputs
++// stay exact; only draft acceptance can change. Captured into CUDA graphs at launch.
++void set_small_t_key_window(std::int32_t keys) noexcept;
++[[nodiscard]] std::int32_t small_t_key_window() noexcept;
++
+ } // namespace ninfer::ops
+diff --git a/src/ops/linear/nvfp4/nvfp4_launch.h b/src/ops/linear/nvfp4/nvfp4_launch.h
+index a135a16..085f8af 100644
+--- a/src/ops/linear/nvfp4/nvfp4_launch.h
++++ b/src/ops/linear/nvfp4/nvfp4_launch.h
+@@ -23,6 +23,9 @@ void launch_nvfp4_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t)
+ // x_fp16: the same activation pre-staged to fp16 (see fp8_stage_bf16_activation_sm70).
+ void launch_nvfp4_volta_qpn_fp16(const Tensor& x, const void* x_fp16, const Weight&, Tensor&,
+                                  cudaStream_t);
++// residual += x x w^T through the QPN kernel with an fp16-staged activation (one BF16 round).
++void launch_nvfp4_volta_qpn_fp16_residual(const Tensor& x, const void* x_fp16, const Weight&,
++                                          Tensor& residual, cudaStream_t);
+ [[nodiscard]] bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k,
+                                              std::int32_t t) noexcept;
+ 
+diff --git a/src/ops/linear/nvfp4/nvfp4_output.cuh b/src/ops/linear/nvfp4/nvfp4_output.cuh
+index 10db8b4..e7b0f28 100644
+--- a/src/ops/linear/nvfp4/nvfp4_output.cuh
++++ b/src/ops/linear/nvfp4/nvfp4_output.cuh
+@@ -30,6 +30,18 @@ struct Nvfp4ContiguousOutput {
+     }
+ };
+ 
++// residual += value with a single BF16 round (linear_add without a projected temporary).
++struct Nvfp4ResidualOutput {
++    __nv_bfloat16* data;
++    std::int32_t rows;
++
++    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
++                                          float value) const {
++        const std::int64_t index = static_cast<std::int64_t>(token) * rows + parent_row;
++        data[index] = __float2bfloat16_rn(value + __bfloat162float(data[index]));
++    }
++};
++
+ // Writes the mma accumulator straight through, no BF16 round. Exists for split-projection SwiGLU
+ // (see nvfp4_linear_swiglu_qpn_split.cuh): two independent QPN2 launches -- one per weight half,
+ // unmodified, at whatever schedule QPN2 already measured fastest for this shape -- write gate and
+diff --git a/src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu b/src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
+index be1e390..7386047 100644
+--- a/src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
++++ b/src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
+@@ -46,6 +46,16 @@ void launch_nvfp4_volta_qpn_fp16(const Tensor& x, const void* x_fp16, const Weig
+         inverse_weight_divisor, stream);
+ }
+ 
++void launch_nvfp4_volta_qpn_fp16_residual(const Tensor& x, const void* x_fp16, const Weight& w,
++                                          Tensor& residual, cudaStream_t stream) {
++    const std::int32_t n                   = residual.ne[0];
++    const float inverse_weight_divisor = 1.0F / w.weight_scale_divisor;
++    launch_nvfp4_volta_qpn_with_fp16_activation(
++        x, w, static_cast<const half*>(x_fp16),
++        Nvfp4ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), n}, n,
++        inverse_weight_divisor, stream);
++}
++
+ #endif // NINFER_VOLTA_BUILD
+ 
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp b/src/ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
+index f300dbe..7435a0f 100644
+--- a/src/ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
++++ b/src/ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
+@@ -1,4 +1,6 @@
+ #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
++#include "ops/linear/fp8/fp8_launch.h"
++#include "ops/linear/nvfp4/nvfp4_launch.h"
+ 
+ #include "core/layout.h"
+ #include "ninfer/ops/linear.h"
+@@ -80,6 +82,20 @@ Tensor allocate_projected(Allocator& allocator, std::int32_t output_rows, std::i
+ 
+ void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& residual,
+                             WorkspaceArena& workspace, cudaStream_t stream) {
++    // Decode widths: fp16-staged activation and the residual add fused into the QPN epilogue
++    // (no projected temporary, no separate residual_add launch, one BF16 round).
++    if (x.ne[1] <= kNvfp4VoltaQpnMaxTokens && nvfp4_volta_qpn_supported(weight.n, weight.k, x.ne[1])) {
++        const std::size_t stage_bytes =
++            static_cast<std::size_t>(x.ne[0]) * static_cast<std::size_t>(x.ne[1]) * 2;
++        const std::size_t aligned_used = (workspace.used() + 255) / 256 * 256;
++        if (workspace.capacity() >= aligned_used && workspace.capacity() - aligned_used >= stage_bytes) {
++            auto stage_scope       = workspace.scope();
++            const DeviceSpan stage = workspace.alloc_bytes(stage_bytes, 256);
++            fp8_stage_bf16_activation_sm70(x, stage.data, stream);
++            launch_nvfp4_volta_qpn_fp16_residual(x, stage.data, weight, residual, stream);
++            return;
++        }
++    }
+     auto scope         = workspace.scope();
+     Tensor projected    = allocate_projected(workspace, weight.n, x.ne[1]);
+     if (x.ne[1] >= 33) {
+@@ -97,6 +113,12 @@ void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& resid
+ 
+ std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
+                                             std::int32_t tokens) {
++    if (tokens <= kNvfp4VoltaQpnMaxTokens &&
++        nvfp4_volta_qpn_supported(output_rows, input_rows, tokens)) {
++        WorkspaceLayoutBuilder stage;  // fused QPN residual route: only the fp16 activation
++        (void)stage.alloc_bytes(static_cast<std::size_t>(input_rows) * static_cast<std::size_t>(tokens) * 2, 256);
++        return stage.peak_bytes(1);
++    }
+     WorkspaceLayoutBuilder layout;
+     (void)allocate_projected(layout, output_rows, tokens);
+     const std::size_t linear_bytes = tokens >= 33
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t.cu b/src/ops/softmax_attention/dense/causal_cache/small_t.cu
+index 27fdd6d..8fe4def 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t.cu
+@@ -20,6 +20,14 @@
+ #include <algorithm>
+ #include <stdexcept>
+ 
++namespace ninfer::ops {
++namespace {
++thread_local std::int32_t t_small_t_key_window = 0;
++} // namespace
++void set_small_t_key_window(std::int32_t keys) noexcept { t_small_t_key_window = keys > 0 ? keys : 0; }
++std::int32_t small_t_key_window() noexcept { return t_small_t_key_window; }
++} // namespace ninfer::ops
++
+ namespace ninfer::ops::detail {
+ namespace {
+ 
+@@ -229,7 +237,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos,
+                 cache.block_tables.ne[0], invocation.width, invocation.full_width,
+                 invocation.column_begin, logical_capacity, scale,
+                 static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
+-                static_cast<float*>(partial_l.data));
++                static_cast<float*>(partial_l.data), ::ninfer::ops::small_t_key_window());
+             CUDA_CHECK(cudaGetLastError());
+             return;
+         }
+@@ -474,8 +482,10 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
+     const auto launch_reduce   = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
+         const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, kDChunk),
+                           invocation.width * invocation.batch_size);
+-        causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
+-                                                        Offset><<<grid, kReduceBlock, 0, stream>>>(
++        const auto reduce_kernel =
++            causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch,
++                                                          Masked, Offset>;
++        reduce_kernel<<<grid, kReduceBlock, 0, stream>>>(
+             static_cast<const float*>(partial_acc.data), static_cast<const float*>(partial_m.data),
+             static_cast<const float*>(partial_l.data), static_cast<const std::int32_t*>(pos.data),
+             invocation.valid_columns
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t.cuh b/src/ops/softmax_attention/dense/causal_cache/small_t.cuh
+index 9a465ed..9cdcd4d 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t.cuh
+@@ -267,15 +267,45 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
+     const float head_l =
+         causal_merge_split_statistics<Geometry>(partial_m, partial_l, q_head, token, tokens,
+                                                 active_split_count, weights, warp_sums, scalars);
+-    const int d = d_start + tid;
+-    if (tid >= DChunk || d >= kCausalHeadDim) return;
++    // When DChunk < blockDim (the 12/2 TP2 shard uses DChunk 64 with 256 threads), the otherwise
++    // idle threads split the split-loop: group g sums splits g, g+Groups, ... and the groups are
++    // combined through shared memory. 4x the loads in flight per output element.
++    constexpr int Groups = (256 / DChunk) > 0 ? (256 / DChunk) : 1;
++    const int group = tid / DChunk;
++    const int dl    = tid - group * DChunk;
++    const int d     = d_start + dl;
+     float numerator = 0.0f;
+-    for (int split = 0; split < active_split_count; ++split) {
+-        if (weights[split] != 0.0f)
++    if (group < Groups && d < kCausalHeadDim) {
++        // No per-split branch: a zero weight belongs to a neutral split whose partial is 0, and the
++        // branch-free, unrolled form keeps several independent loads in flight per thread (the
++        // guarded loop issued them one at a time and was latency-bound at ~30 us per call).
++        int split = group;
++        for (; split + 7 * Groups < active_split_count; split += 8 * Groups) {
++            float v[8];
++#pragma unroll
++            for (int u = 0; u < 8; ++u) {
++                v[u] = partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token,
++                                                                      split + u * Groups, tokens)];
++            }
++#pragma unroll
++            for (int u = 0; u < 8; ++u) { numerator += v[u] * weights[split + u * Groups]; }
++        }
++        for (; split < active_split_count; split += Groups) {
+             numerator +=
+                 partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] *
+                 weights[split];
++        }
++    }
++    if constexpr (Groups > 1) {
++        __shared__ float group_sums[Groups][DChunk];
++        if (group < Groups) { group_sums[group][dl] = numerator; }
++        __syncthreads();
++        if (group != 0) { return; }
++        numerator = 0.0f;
++#pragma unroll
++        for (int g = 0; g < Groups; ++g) { numerator += group_sums[g][dl]; }
+     }
++    if (group != 0 || d >= kCausalHeadDim) return;
+ 
+     const float value = (head_l > 0.0f) ? numerator / head_l : 0.0f;
+     out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_i8_volta_v2.cuh b/src/ops/softmax_attention/dense/causal_cache/small_t_i8_volta_v2.cuh
+index be5d5b4..97c305b 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_i8_volta_v2.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_i8_volta_v2.cuh
+@@ -63,7 +63,7 @@ __launch_bounds__(kCausalSmallTI8VoltaV2Warps * 32, 1) __global__
+     const std::int32_t* block_tables, const std::int32_t* valid_columns,
+     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
+     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
+-    float* partial_acc, float* partial_m, float* partial_l) {
++    float* partial_acc, float* partial_m, float* partial_l, std::int32_t key_window = 0) {
+ #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+     constexpr int Warps         = kCausalSmallTI8VoltaV2Warps;
+     constexpr int Threads       = Warps * 32;
+@@ -169,11 +169,15 @@ __launch_bounds__(kCausalSmallTI8VoltaV2Warps * 32, 1) __global__
+         causal_small_t_active_splits<Geometry, true>(window, split_count, tokens);
+     if (split >= active_split_count) { return; }
+ 
+-    const int logical_tiles = div_up(window, Bc);
++    // Optional draft-side key window: splits cover [key_begin, window) instead of [0, window).
++    const int key_begin =
++        (key_window > 0 && window > key_window) ? ((window - key_window) / Bc) * Bc : 0;
++    const int span          = window - key_begin;
++    const int logical_tiles = div_up(span, Bc);
+     const bool tile_split   = logical_tiles >= active_split_count;
+     const int units_per_split =
+-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
+-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
++        tile_split ? div_up(logical_tiles, active_split_count) : div_up(span, active_split_count);
++    const int split_start = key_begin + split * units_per_split * (tile_split ? Bc : 1);
+     const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+     const int split_end   = (split_limit < window) ? split_limit : window;
+     if (split_start >= split_end) {
+diff --git a/src/targets/qwen3_6/impl/runtime/text_context_impl.h b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+index 1eab762..5bc8c84 100644
+--- a/src/targets/qwen3_6/impl/runtime/text_context_impl.h
++++ b/src/targets/qwen3_6/impl/runtime/text_context_impl.h
+@@ -402,6 +402,23 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
+     ops::rmsnorm(x, *mtp_.input_norm, kCfg.rms_eps, true, ah, s);
+ }
+ 
++namespace {
++// NINFER_MTP_ATTN_WINDOW=W: the MTP (draft) layer attends only to the last W keys. Target-model
++// attention is untouched, so outputs are unchanged; only draft acceptance can move.
++struct MtpKeyWindowScope {
++    MtpKeyWindowScope() noexcept {
++        static const std::int32_t window = [] {
++            const char* v = std::getenv("NINFER_MTP_ATTN_WINDOW");
++            return v != nullptr ? static_cast<std::int32_t>(std::atoi(v)) : 0;
++        }();
++        ops::set_small_t_key_window(window);
++    }
++    ~MtpKeyWindowScope() { ops::set_small_t_key_window(0); }
++    MtpKeyWindowScope(const MtpKeyWindowScope&)            = delete;
++    MtpKeyWindowScope& operator=(const MtpKeyWindowScope&) = delete;
++};
++} // namespace
++
+ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
+                                    const Tensor& rope_positions,
+                                    ops::CausalAttentionExecutionEnvelope envelope,
+@@ -430,6 +447,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
+     ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+ 
+     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
++    const MtpKeyWindowScope mtp_key_window;
+     if (active_sequence_batch_ != 0) {
+         const std::int32_t width = active_sequence_width_;
+         if (width <= 0 || width * active_sequence_batch_ != T ||
+diff --git a/src/targets/qwen3_6_27b_tp2/impl/tp2_comm.cpp b/src/targets/qwen3_6_27b_tp2/impl/tp2_comm.cpp
+index f5313f4..bc9444f 100644
+--- a/src/targets/qwen3_6_27b_tp2/impl/tp2_comm.cpp
++++ b/src/targets/qwen3_6_27b_tp2/impl/tp2_comm.cpp
+@@ -72,34 +72,44 @@ std::uint64_t id_nonce(const ncclUniqueId& id) {
+ // sees the same nonce, so a stale file from an earlier run can never be mistaken for this one.
+ void init_mailbox(int rank, const std::string& path, std::uint64_t nonce) {
+     const std::size_t bytes = (sizeof(MailboxShared) + 4095) / 4096 * 4096;
+-    int fd = -1;
++    void* host = nullptr;
+     if (rank == 0) {
+-        fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
++        // Build the block under a private name and publish it with an atomic rename: the peer may
++        // still have a previous run's file mapped, and truncating that inode in place would SIGBUS it.
++        const std::string tmp = path + ".tmp";
++        ::unlink(tmp.c_str());
++        const int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+         if (fd < 0 || ::ftruncate(fd, static_cast<off_t>(bytes)) != 0) {
+-            throw std::runtime_error("TP2: cannot create mailbox " + path);
+-        }
+-    } else {
+-        for (int attempt = 0;; ++attempt) {
+-            fd = ::open(path.c_str(), O_RDWR);
+-            struct stat st {};
+-            if (fd >= 0 && ::fstat(fd, &st) == 0 && static_cast<std::size_t>(st.st_size) >= bytes) { break; }
+-            if (fd >= 0) { ::close(fd); fd = -1; }
+-            if (attempt > 6000) { throw std::runtime_error("TP2: timed out waiting for mailbox"); }
+-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++            throw std::runtime_error("TP2: cannot create mailbox " + tmp);
+         }
+-    }
+-    void* host = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+-    ::close(fd);
+-    if (host == MAP_FAILED) { throw std::runtime_error("TP2: mailbox mmap failed"); }
+-    auto* mb = static_cast<MailboxShared*>(host);
+-    auto* magic = reinterpret_cast<volatile std::uint64_t*>(&mb->magic);
+-    if (rank == 0) {
++        host = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++        ::close(fd);
++        if (host == MAP_FAILED) { throw std::runtime_error("TP2: mailbox mmap failed"); }
+         std::memset(host, 0, bytes);
+         std::atomic_thread_fence(std::memory_order_seq_cst);
+-        *magic = nonce;
++        *reinterpret_cast<volatile std::uint64_t*>(&static_cast<MailboxShared*>(host)->magic) = nonce;
++        if (std::rename(tmp.c_str(), path.c_str()) != 0) {
++            throw std::runtime_error("TP2: cannot publish mailbox " + path);
++        }
+     } else {
+-        for (int attempt = 0; *magic != nonce; ++attempt) {
+-            if (attempt > 6000) { throw std::runtime_error("TP2: mailbox nonce mismatch"); }
++        // Re-open until the file carries this run's nonce (an older file is simply skipped).
++        for (int attempt = 0;; ++attempt) {
++            if (attempt > 6000) { throw std::runtime_error("TP2: timed out waiting for mailbox"); }
++            const int fd = ::open(path.c_str(), O_RDWR);
++            struct stat st {};
++            if (fd >= 0 && ::fstat(fd, &st) == 0 && static_cast<std::size_t>(st.st_size) == bytes) {
++                void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++                ::close(fd);
++                if (p != MAP_FAILED) {
++                    if (*reinterpret_cast<volatile std::uint64_t*>(&static_cast<MailboxShared*>(p)->magic) == nonce) {
++                        host = p;
++                        break;
++                    }
++                    ::munmap(p, bytes);
++                }
++            } else if (fd >= 0) {
++                ::close(fd);
++            }
+             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+         }
+     }
+diff --git a/src/targets/qwen3_6_27b_tp2/impl/variant.cpp b/src/targets/qwen3_6_27b_tp2/impl/variant.cpp
+index fc20f2d..25cfc00 100644
+--- a/src/targets/qwen3_6_27b_tp2/impl/variant.cpp
++++ b/src/targets/qwen3_6_27b_tp2/impl/variant.cpp
+@@ -332,9 +332,16 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights,
+     debug::dump_last_column_once(activation, "pm_act", stream);
+     debug::dump_last_column_once(residual, "pm_res_in", stream);
+     if (tp2::rank() != 0) {
+-        // Rank 1 contributes only its partial sum. The load step prepacks NVFP4 MLP weights for
+-        // the Volta QPN route, which linear_add reads correctly at every width but linear's
+-        // wide-T MMA route does not; so zero the destination and reuse linear_add.
++        // Rank 1 contributes only its partial sum. At decode widths linear() takes the QPN route,
++        // which reads the prepacked NVFP4 weights correctly, so it writes the partial directly.
++        // Wider (prefill) linear() would take the MMA route, which misreads prepacked weights:
++        // zero the destination and reuse linear_add there.
++        if (activation.ne[1] <= 32) {
++            ops::linear(activation, weights.down, residual, text_policy(weights.down), workspace,
++                        stream);
++            tp2::allreduce(residual, stream);
++            return;
++        }
+         CUDA_CHECK(cudaMemsetAsync(residual.data, 0,
+                                    static_cast<std::size_t>(residual.ne[0]) * residual.ne[1] *
+                                        sizeof(std::uint16_t),
+-- 
+2.43.0
+

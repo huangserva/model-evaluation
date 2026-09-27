@@ -1,0 +1,303 @@
+From 5b1fa54daa9abe8da124d866a66b69a5e2f43b83 Mon Sep 17 00:00:00 2001
+From: huangserva <huangserva@gmail.com>
+Date: Sat, 26 Sep 2026 05:09:37 +0800
+Subject: [PATCH 04/11] feat(sm70/tp2): register d256-h12-kv2 causal attention
+ geometry
+
+TP2 rank shard of d256-h24-kv4 (same GQA ratio 6, SmallTSplitScale 2).
+BF16/INT8 KV routes: small-T decode (v2 key-split kernel), prompt, Volta
+flash prefill (64-column tile). Tests cover h12-kv2 for BF16/INT8.
+186K INT8 decode T=4: 1401us (h24) -> 861us (h12); 131K 2048-token
+prefill 176.0 -> 88.3 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ TP2_PLAN.md                                   |  9 +++++
+ bench/ops/causal_softmax_attention_bench.cu   |  6 +++-
+ src/ops/launcher/gqa_attention_volta_flash.cu | 14 ++++++++
+ .../causal_cache/causal_softmax_attention.cpp | 10 ++++--
+ .../dense/causal_cache/geometry.cuh           |  2 ++
+ .../dense/causal_cache/prompt.cu              | 15 ++++++++
+ .../dense/causal_cache/small_t.cu             | 35 +++++++++++++++++++
+ tests/ops/softmax_attention/causal_cache.cpp  |  4 +++
+ 8 files changed, 91 insertions(+), 4 deletions(-)
+ create mode 100644 TP2_PLAN.md
+
+diff --git a/TP2_PLAN.md b/TP2_PLAN.md
+new file mode 100644
+index 0000000..9a379c6
+--- /dev/null
++++ b/TP2_PLAN.md
+@@ -0,0 +1,9 @@
++# ninfer TP2 plan (2026-09-26) — insertion map (HEAD 7889625)
++- Forward: src/targets/qwen3_6/impl/runtime/text_context_impl.h run_layers:1013; attn_mix:818 (o_proj linear_add :878, variant.cpp:185), gdn_mix:881 (out linear_add :986, variant.cpp:284), mlp_tail:1002 (post_mixer variant.cpp:308: linear_swiglu 34816x5120 + linear_add 5120x17408).
++- Allreduce points: after o_proj, GDN out, MLP down (+ MTP o_proj :413 and mtp_post_mixer variant.cpp:330, already unfused). NVFP4 down is LinearThenAdd (nvfp4_linear_add_plan.cpp:74-90) -> AR between linear and residual_add. FP8 fused for T<=32: rank0 linear_add into x, rank1 into zeroed tmp, then AR.
++- Shapes: TextConfig qwen3_6_27b/impl/config.h:13-58 (q 24->12, kv 4->2, gdn k 16->8, v 48->24, inter 17408->8704). Gates: nvfp4_config.h:120-170, fp8_config.h:122-190, wrapper/linear_add.cpp, linear_swiglu.cpp, attn_input_proj (fp8_attn_input_output.cuh rows [Q6144|K1024|G6144|V1024]), gdn_input_proj (fp8_gdn_input_output.cuh [q2048|k2048|v6144|z6144], static_assert 16384), gdn_projected_conv.cu launch<10240,2048,2048,6144>, CausalConvSplitGeometry, gdn gating H=48, FoldGeometry<48,16,48,10240>, CausalD256H24Kv4 geometry.cuh:25 (+ volta flash tiling, small_t v2 kernel), workspace variant.cpp.
++- Weights: bindings.cpp bind_qwen38_nvfp4_text_layers:350-414; load_mlp:183; QPN prepack at load (shape-generic) -> must prepack sharded tensor. Artifact whole-object only -> make per-rank artifacts offline (tools/artifact, tools/convert/qwen3_8_27b) with new weights_id (package.cpp:84, registry.cpp:196).
++- Graphs: prepare_graphs program_impl.h:10996 (captures+warm launches: collective count must match on both ranks). Prefill eager (text_prefill_impl.h:54). decode_graph.cpp capture ThreadLocal.
++- Lockstep: mirror at Program boundary (advance_prefill, decode, commit...), not HTTP. Seed: forward resolved seed. Start with --no-prefix-reuse --host-kv-mib 0.
++- NCCL: need sm_70 build (~/linkprobe/nccl221). In-graph AR measured 15us@10KB, 24us@40KB; >=160KB fails in graph -> prefill eager.
++- Reference impl: ~/ninfer-duo (plus1998/NInfer-V100-Duo, different ninfer version; host-staged copies 277us/AR -> 53 tok/s@85K).
+diff --git a/bench/ops/causal_softmax_attention_bench.cu b/bench/ops/causal_softmax_attention_bench.cu
+index 5e6df58..e1c478f 100644
+--- a/bench/ops/causal_softmax_attention_bench.cu
++++ b/bench/ops/causal_softmax_attention_bench.cu
+@@ -39,7 +39,7 @@ constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
+ 
+ 
+ enum class Entry : std::uint8_t { Append, Cached, Both };
+-enum class GeometryChoice : std::uint8_t { H24Kv4, H16Kv2, All };
++enum class GeometryChoice : std::uint8_t { H24Kv4, H16Kv2, H12Kv2, All };
+ enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, Nvfp4, K8V4, All };
+ enum class Execution : std::uint8_t { Eager, Graph, Both };
+ enum class CacheMode : std::uint8_t { Cold, Warm, Both };
+@@ -54,6 +54,7 @@ struct Geometry {
+ 
+ constexpr Geometry kH24Kv4{"d256-h24-kv4", 24, 4};
+ constexpr Geometry kH16Kv2{"d256-h16-kv2", 16, 2};
++constexpr Geometry kH12Kv2{"d256-h12-kv2", 12, 2};
+ 
+ struct Options {
+     Entry entry             = Entry::Both;
+@@ -171,6 +172,8 @@ Options parse_options(int argc, char** argv) {
+                 options.geometry = GeometryChoice::H24Kv4;
+             else if (value == "d256-h16-kv2")
+                 options.geometry = GeometryChoice::H16Kv2;
++            else if (value == "d256-h12-kv2")
++                options.geometry = GeometryChoice::H12Kv2;
+             else if (value == "all")
+                 options.geometry = GeometryChoice::All;
+             else
+@@ -800,6 +803,7 @@ void profile(Case& data, Entry entry, const Geometry& geometry, KvCacheStorage s
+ std::vector<Geometry> selected_geometries(GeometryChoice choice) {
+     if (choice == GeometryChoice::H24Kv4) { return {kH24Kv4}; }
+     if (choice == GeometryChoice::H16Kv2) { return {kH16Kv2}; }
++    if (choice == GeometryChoice::H12Kv2) { return {kH12Kv2}; }
+     return {kH24Kv4, kH16Kv2};
+ }
+ 
+diff --git a/src/ops/launcher/gqa_attention_volta_flash.cu b/src/ops/launcher/gqa_attention_volta_flash.cu
+index c843581..a386b03 100644
+--- a/src/ops/launcher/gqa_attention_volta_flash.cu
++++ b/src/ops/launcher/gqa_attention_volta_flash.cu
+@@ -62,6 +62,13 @@ struct VoltaFlashTiling<CausalD256H24Kv4> {
+     static constexpr int ncols1 = 32;
+ };
+ 
++template <>
++struct VoltaFlashTiling<CausalD256H12Kv2> {
++    // TP2 shard of H24Kv4: same GQA ratio, so the same tuned 64-column tile.
++    static constexpr int ncols2 = 2;
++    static constexpr int ncols1 = 32;
++};
++
+ template <>
+ struct VoltaFlashTiling<CausalD256H16Kv2> {
+     static constexpr int ncols2 = 8;
+@@ -582,6 +589,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
+ // The two registered geometries differ only in tiling; both are instantiated so
+ // the route can serve 27B (24q/4kv) and 35B-A3B (16q/2kv) from one launcher.
+ std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads, std::int32_t tokens) {
++    if (q_heads == CausalD256H12Kv2::QHeads) { return meta_elements_impl<CausalD256H12Kv2>(tokens); }
+     if (q_heads == CausalD256H24Kv4::QHeads) { return meta_elements_impl<CausalD256H24Kv4>(tokens); }
+     if (q_heads == CausalD256H16Kv2::QHeads) { return meta_elements_impl<CausalD256H16Kv2>(tokens); }
+     throw std::invalid_argument("gqa_attention volta flash: unsupported Q head geometry");
+@@ -594,6 +602,12 @@ void causal_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const
+                                       Tensor& k_gathered, Tensor& v_gathered, Tensor& mask,
+                                       Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta, Tensor& out,
+                                       cudaStream_t stream) {
++    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
++        volta_flash_launch_impl<CausalD256H12Kv2>(q, k, v, positions, table_rows, scale, cache,
++                                               envelope, q_block_tokens, k_gathered, v_gathered,
++                                               mask, q_f32, out_f32, dst_meta, out, stream);
++        return;
++    }
+     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
+         volta_flash_launch_impl<CausalD256H24Kv4>(q, k, v, positions, table_rows, scale, cache,
+                                                envelope, q_block_tokens, k_gathered, v_gathered,
+diff --git a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+index 7ef14e6..06359ea 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
++++ b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+@@ -38,7 +38,8 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
+ void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
+     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
+         !((geometry.query_heads == 24 && geometry.kv_heads == 4) ||
+-          (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
++          (geometry.query_heads == 16 && geometry.kv_heads == 2) ||
++          (geometry.query_heads == 12 && geometry.kv_heads == 2))) {
+         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
+     }
+ }
+@@ -275,7 +276,8 @@ struct SmallTWorkspace {
+ bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
+                                 std::int32_t batch_size, KvCacheStorage cache_storage) {
+     const bool supported_geometry = q_heads == CausalD256H24Kv4::QHeads ||
+-                                    q_heads == CausalD256H16Kv2::QHeads;
++                                    q_heads == CausalD256H16Kv2::QHeads ||
++                                    q_heads == CausalD256H12Kv2::QHeads;
+     return supported_geometry && batch_size == 1 &&
+            (cache_storage == KvCacheStorage::BFloat16 ||
+             cache_storage == KvCacheStorage::Int8Group64) &&
+@@ -298,7 +300,9 @@ VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace,
+                                                    CausalAttentionExecutionEnvelope envelope) {
+     const std::int32_t kv_heads = q_heads == CausalD256H24Kv4::QHeads
+                                       ? CausalD256H24Kv4::KVHeads
+-                                      : CausalD256H16Kv2::KVHeads;
++                                      : (q_heads == CausalD256H12Kv2::QHeads
++                                             ? CausalD256H12Kv2::KVHeads
++                                             : CausalD256H16Kv2::KVHeads);
+     const auto visible          = static_cast<std::int32_t>(envelope.max_visible_keys);
+     const std::int32_t n_kv =
+         ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
+diff --git a/src/ops/softmax_attention/dense/causal_cache/geometry.cuh b/src/ops/softmax_attention/dense/causal_cache/geometry.cuh
+index 3e7a5f1..83550b8 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/geometry.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/geometry.cuh
+@@ -24,5 +24,7 @@ struct CausalAttentionGeometry : AttentionHeadMapping<QHeadsValue, KVHeadsValue>
+ 
+ using CausalD256H24Kv4 = CausalAttentionGeometry<24, 4, 1>;
+ using CausalD256H16Kv2 = CausalAttentionGeometry<16, 2, 2>;
++// TP2 shard of CausalD256H24Kv4 (one rank holds 12 query / 2 KV heads, same GQA ratio 6).
++using CausalD256H12Kv2 = CausalAttentionGeometry<12, 2, 2>;
+ 
+ } // namespace ninfer::ops
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt.cu b/src/ops/softmax_attention/dense/causal_cache/prompt.cu
+index c84467a..86b15c3 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/prompt.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt.cu
+@@ -102,6 +102,11 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
+         return;
+     }
+     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
++    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
++        causal_attention_prompt_attention_launch_for<CausalD256H12Kv2>(q, positions, scale, cache,
++                                                                       metadata, out, stream);
++        return;
++    }
+     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
+         causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(q, positions, scale, cache,
+                                                                        metadata, out, stream);
+@@ -144,6 +149,11 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
+             .table_rows   = static_cast<const std::int32_t*>(table_row.data),
+             .table_stride = cache.block_tables.ne[0],
+         };
++        if (q_row.ne[1] == CausalD256H12Kv2::QHeads) {
++            causal_attention_prompt_attention_launch_for<CausalD256H12Kv2>(
++                q_row, positions_row, scale, cache, metadata, out_row, stream);
++            return;
++        }
+         if (q_row.ne[1] == CausalD256H24Kv4::QHeads) {
+             causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(
+                 q_row, positions_row, scale, cache, metadata, out_row, stream);
+@@ -178,6 +188,11 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
+             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
+             .table_stride = cache.block_tables.ne[0],
+         };
++        if (q.ne[1] == CausalD256H12Kv2::QHeads) {
++            causal_attention_prompt_attention_launch_for<CausalD256H12Kv2>(
++                q, positions, scale, cache, metadata, out, stream);
++            return;
++        }
+         if (q.ne[1] == CausalD256H24Kv4::QHeads) {
+             causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(
+                 q, positions, scale, cache, metadata, out, stream);
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t.cu b/src/ops/softmax_attention/dense/causal_cache/small_t.cu
+index 03b9984..1a0fc75 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t.cu
+@@ -327,6 +327,29 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t
+         throw std::invalid_argument("causal_softmax_attention split capacity: invalid profile");
+     }
+     (void)paged_kv_storage_layout(cache_storage, kCausalHeadDim);
++    if (q_heads == CausalD256H12Kv2::QHeads) {
++        const int capacity =
++            causal_small_t_launch_capacity<CausalD256H12Kv2>(envelope, tokens, cache_storage);
++        if (batch_size > 1) {
++            // Keep complete grids within one or two 170-SM waves. Rounding from 160 CTAs
++            // leaves room for the indivisible 4*B group, including B=3/5/6/7.
++            const bool narrow = tokens <= 5;
++            int target_ctas   = 160;
++            if (cache_storage == KvCacheStorage::BFloat16)
++                target_ctas =
++                    narrow || batch_size >= 5 || envelope.max_visible_keys > 4096 ? 320 : 160;
++            else if (cache_storage == KvCacheStorage::Int8Group64)
++                target_ctas = narrow || envelope.max_visible_keys > 4096 ? 320 : 160;
++            else if (cache_storage == KvCacheStorage::Nvfp4Group16)
++                target_ctas = narrow ? 320 : 160;
++            const int grid_limit = div_up(target_ctas, 4 * batch_size);
++            // A split stages at most 64 physical-page IDs. Leave two 64-key pages for
++            // key-tile rounding and page alignment at the 262144-key resource limit.
++            const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
++            return std::min(capacity, std::max({4, grid_limit, page_limit}));
++        }
++        return capacity;
++    }
+     if (q_heads == CausalD256H24Kv4::QHeads) {
+         const int capacity =
+             causal_small_t_launch_capacity<CausalD256H24Kv4>(envelope, tokens, cache_storage);
+@@ -506,6 +529,12 @@ void causal_attention_small_t_launch(
+         .width         = width,
+         .batch_size    = q.ne[3],
+     };
++    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
++        causal_attention_small_t_launch_for<CausalD256H12Kv2>(q, input, pos, scale, cache,
++                                                              invocation, envelope, partial_acc,
++                                                              partial_m, partial_l, out, stream);
++        return;
++    }
+     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
+         causal_attention_small_t_launch_for<CausalD256H24Kv4>(q, input, pos, scale, cache,
+                                                               invocation, envelope, partial_acc,
+@@ -547,6 +576,12 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos,
+         .batch_size    = 1,
+     };
+     const PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
++    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
++        causal_attention_small_t_launch_for<CausalD256H12Kv2>(q, input, pos, scale, batch_cache,
++                                                              invocation, envelope, partial_acc,
++                                                              partial_m, partial_l, out, stream);
++        return;
++    }
+     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
+         causal_attention_small_t_launch_for<CausalD256H24Kv4>(q, input, pos, scale, batch_cache,
+                                                               invocation, envelope, partial_acc,
+diff --git a/tests/ops/softmax_attention/causal_cache.cpp b/tests/ops/softmax_attention/causal_cache.cpp
+index fd3d9f6..eefbf8e 100644
+--- a/tests/ops/softmax_attention/causal_cache.cpp
++++ b/tests/ops/softmax_attention/causal_cache.cpp
+@@ -113,6 +113,7 @@ struct Geometry {
+ constexpr Geometry kGeometries[] = {
+     {"d256-h24-kv4", 24, 4},
+     {"d256-h16-kv2", 16, 2},
++    {"d256-h12-kv2", 12, 2}, // TP2 rank shard of d256-h24-kv4
+ };
+ 
+ ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
+@@ -2310,6 +2311,7 @@ int run_geometry(const Geometry& geometry) {
+ int run_fp8_cases() {
+     int failures = 0;
+     for (const Geometry& geometry : kGeometries) {
++        if (geometry.q_heads == 12) { continue; } // TP2 shard: BF16/INT8 KV only
+         failures += run_a1_case(geometry, KvCacheStorage::Fp8E4M3Row256, {65, 63, 192, 601u},
+                                 MappingPattern::Fragmented);
+         failures += run_a3_case(geometry, KvCacheStorage::Fp8E4M3Row256, {65, 63, 192, 602u},
+@@ -2331,6 +2333,7 @@ int run_fp8_cases() {
+ int run_nvfp4_cases() {
+     int failures = 0;
+     for (const Geometry& geometry : kGeometries) {
++        if (geometry.q_heads == 12) { continue; } // TP2 shard: BF16/INT8 KV only
+         failures += run_a1_case(geometry, KvCacheStorage::Nvfp4Group16, {1, 0, 1, 701u},
+                                 MappingPattern::Identity);
+         failures += run_a3_case(geometry, KvCacheStorage::Nvfp4Group16, {1, 64, 65, 702u},
+@@ -2376,6 +2379,7 @@ int run_nvfp4_cases() {
+ int run_k8v4_cases() {
+     int failures = 0;
+     for (const Geometry& geometry : kGeometries) {
++        if (geometry.q_heads == 12) { continue; } // TP2 shard: BF16/INT8 KV only
+         failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 0, 1, 801u},
+                                 MappingPattern::Identity);
+         failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 64, 65, 802u},
+-- 
+2.43.0
+

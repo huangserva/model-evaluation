@@ -1,0 +1,33 @@
+#include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
+#include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
+#include "ops/linear/fp8/fp8_volta_qpn_gemm.cuh"
+
+#include <cuda_bf16.h>
+
+namespace ninfer::ops::detail {
+
+#ifdef NINFER_VOLTA_BUILD
+
+// The attention projections are where the model's FP8 weights actually live -- two per layer for
+// all 64 layers -- so the quadpair route matters here more than it does in plain Linear. The
+// parent GEMM is identical; only the epilogue differs, and the output policy carries that.
+void launch_fp8_attn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& query,
+                                     const void* x_fp16, Tensor& gate, Tensor& key, Tensor& value,
+                                     cudaStream_t stream) {
+    Fp8AttentionInputOutput output{static_cast<__nv_bfloat16*>(query.data),
+                                   static_cast<__nv_bfloat16*>(key.data),
+                                   static_cast<__nv_bfloat16*>(gate.data),
+                                   static_cast<__nv_bfloat16*>(value.data)};
+    output.query_rows = weight.n * 3 / 7; // 6144 of 14336, or 3072 of a 7168-row TP2 shard
+    output.key_rows   = weight.n / 14;    // 1024, or 512
+    if (x_fp16 != nullptr) {
+        launch_fp8_volta_qpn_with_fp16_activation(
+            x, weight, static_cast<const half*>(x_fp16), output, weight.n, stream);
+    } else {
+        launch_fp8_volta_qpn_with_output(x, weight, output, weight.n, stream);
+    }
+}
+
+#endif // NINFER_VOLTA_BUILD
+
+} // namespace ninfer::ops::detail

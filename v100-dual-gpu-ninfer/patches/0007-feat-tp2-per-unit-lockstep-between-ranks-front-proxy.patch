@@ -1,0 +1,771 @@
+From 4a570e23a759b147d927b1509c1dfdfd3a4b2893 Mon Sep 17 00:00:00 2001
+From: huangserva <huangserva@gmail.com>
+Date: Sat, 26 Sep 2026 09:35:25 +0800
+Subject: [PATCH 07/11] feat(tp2): per-unit lockstep between ranks + front
+ proxy/supervisor
+
+runtime/engine/tp_lockstep.h: once per GPU unit (each prefill chunk, each
+decode round) the two engines exchange, over a shared-memory block, their
+cancellation view, committed token count/hash and position. Cancellation
+is the OR of both views, so both ranks abort at the same unit; any other
+difference aborts the process with "TP2 LOCKSTEP FAILURE". Local
+cancellation (boundary cancel, pending-queue drop) is inert under TP.
+
+tools/tp2/tp2_proxy.py: stdlib proxy that starts both ranks, serialises
+generation requests, duplicates each body to both ranks, relays rank 0,
+drains rank 1, cancels rank 0 on client EOF (stream or not), and restarts
+both processes on exit/stall with a 503 to the client.
+
+Tested through the proxy (and in the ninfer-v100:qwen38-tp2 container):
+stream/non-stream, no-seed sampling, drop mid-decode, drop mid-prefill,
+client timeout, max_tokens, stop, image, image+drop, Anthropic, Responses,
+multi-turn prefix reuse, rank kill, rank freeze, forced hash divergence.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/runtime/engine/engine_core.h              |  74 +++-
+ src/runtime/engine/tp_lockstep.h              | 193 +++++++++
+ src/targets/qwen3_6_27b_tp2/impl/tp2_comm.cpp |   3 +
+ tools/tp2/tp2_proxy.py                        | 392 ++++++++++++++++++
+ 4 files changed, 661 insertions(+), 1 deletion(-)
+ create mode 100644 src/runtime/engine/tp_lockstep.h
+ create mode 100644 tools/tp2/tp2_proxy.py
+
+diff --git a/src/runtime/engine/engine_core.h b/src/runtime/engine/engine_core.h
+index d4d9b2d..b2c63e2 100644
+--- a/src/runtime/engine/engine_core.h
++++ b/src/runtime/engine/engine_core.h
+@@ -9,6 +9,7 @@
+ #include "runtime/engine/request_record.h"
+ #include "runtime/engine/resource_manager.h"
+ #include "runtime/engine/scheduler.h"
++#include "runtime/engine/tp_lockstep.h"
+ #include "runtime/generation/generation_budget.h"
+ 
+ #include <algorithm>
+@@ -905,12 +906,35 @@ private:
+         }
+     }
+ 
++    [[nodiscard]] std::array<bool, kMaximumConcurrency>
++    tp_agree_cancellations(tp::Lockstep& lockstep, tp::UnitKind kind, std::uint64_t count,
++                           std::uint64_t hash, std::uint64_t position) const {
++        const auto local  = snapshot_cancellations_raw();
++        std::uint64_t mask = 0;
++        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
++            if (local[lane]) { mask |= std::uint64_t{1} << lane; }
++        }
++        const std::uint64_t agreed = lockstep.exchange(kind, mask, count, hash, position);
++        std::array<bool, kMaximumConcurrency> cancelled{};
++        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
++            cancelled[lane] = slots_[lane] != nullptr && ((agreed >> lane) & 1U) != 0;
++        }
++        return cancelled;
++    }
++
+     void remove_completed_slot(std::uint32_t lane) {
+         slots_[lane].reset();
+         request_admission_check();
+     }
+ 
++    // Under TP lockstep a rank must not act on its own cancellation view: both ranks agree on it
++    // once per GPU unit (tp_agree_cancellations) so they abort at the same unit.
+     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
++        if (tp::Lockstep::instance() != nullptr) { return {}; }
++        return snapshot_cancellations_raw();
++    }
++
++    [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations_raw() const noexcept {
+         std::array<bool, kMaximumConcurrency> cancelled{};
+         // An already-issued active unit may finish while another row owns the global resource
+         // transaction.  Its cancellation cannot release topology until that transaction reaches
+@@ -1003,7 +1027,8 @@ private:
+             std::lock_guard lock(queue_mutex_);
+             const auto now = Clock::now();
+             for (auto it = pending_.begin(); it != pending_.end();) {
+-                if ((*it)->cancelled.load(std::memory_order_acquire)) {
++                if ((*it)->cancelled.load(std::memory_order_acquire) &&
++                    tp::Lockstep::instance() == nullptr) {
+                     cancelled.push_back(*it);
+                     it = pending_.erase(it);
+                 } else if (now >= (*it)->deadline) {
+@@ -1395,6 +1420,32 @@ private:
+         auto progress =
+             instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
+         program_call.finish(progress.timing);
++        if (auto* lockstep = tp::Lockstep::instance()) {
++            std::uint64_t hash = 1469598103934665603ULL;
++            if (progress.pending) {
++                const auto& first = *progress.pending;
++                const std::int32_t n = first.row_counts().empty() ? 1 : first.row_counts()[0];
++                if (n > 0 && static_cast<std::size_t>(n) <= first.tokens().size()) {
++                    hash = tp::Lockstep::hash_tokens(
++                        first.tokens().subspan(0, static_cast<std::size_t>(n)), hash);
++                }
++            }
++            const std::uint64_t count = (static_cast<std::uint64_t>(progress.processed_prompt_tokens)
++                                         << 2) |
++                                        (progress.complete ? 1U : 0U) |
++                                        (progress.capture ? 2U : 0U);
++            const auto agreed = tp_agree_cancellations(*lockstep, tp::UnitKind::Prefill, count,
++                                                       hash, request->computed_prompt_tokens);
++            resolve_prefill_progress(request, std::move(progress), agreed);
++            if (agreed[lane] && slots_[lane] == request) {
++                // Both ranks abort the partially prefilled request after the same chunk.
++                HostPhaseMeasurement boundary = begin_host_phase();
++                cancel_active_requests(agreed, boundary);
++                finish_engine_phase(boundary, EngineHostPhase::Boundary);
++            }
++            publish_runtime_stats();
++            return;
++        }
+         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+         publish_runtime_stats();
+     }
+@@ -1798,6 +1849,27 @@ private:
+         auto pending = instance_.program->decode(
+             membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
+         program_call.finish(pending.execution_timing());
++        if (auto* lockstep = tp::Lockstep::instance()) {
++            std::uint64_t hash = 1469598103934665603ULL;
++            std::uint64_t count = 0;
++            std::uint64_t position = 0;
++            const auto lanes = membership.lane_span();
++            for (std::size_t row = 0; row < lanes.size(); ++row) {
++                const std::int32_t n = pending.row_counts().empty() ? 1 : pending.row_counts()[row];
++                const auto begin = row * pending.row_stride();
++                if (n > 0 && begin + static_cast<std::size_t>(n) <= pending.tokens().size()) {
++                    hash = tp::Lockstep::hash_tokens(
++                        pending.tokens().subspan(begin, static_cast<std::size_t>(n)), hash);
++                }
++                count    = count * 64 + static_cast<std::uint64_t>(n);
++                position += slots_[lanes[row]] != nullptr ? slots_[lanes[row]]->generated.size() : 0;
++            }
++            const auto agreed =
++                tp_agree_cancellations(*lockstep, tp::UnitKind::Decode, count, hash, position);
++            commit_pending(std::move(pending), lanes, true, agreed);
++            publish_runtime_stats();
++            return;
++        }
+         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
+         publish_runtime_stats();
+     }
+diff --git a/src/runtime/engine/tp_lockstep.h b/src/runtime/engine/tp_lockstep.h
+new file mode 100644
+index 0000000..7ca3df2
+--- /dev/null
++++ b/src/runtime/engine/tp_lockstep.h
+@@ -0,0 +1,193 @@
++#pragma once
++// Two-process tensor-parallel lockstep (TP2 bring-up).
++//
++// Each rank runs its own Engine; the model's collectives only line up if both engines issue the
++// same GPU units in the same order and make the same host decisions. Wall-clock driven decisions
++// (client cancellation) are therefore agreed here once per GPU unit, and each unit's committed
++// result (token count + token hash) is compared; any disagreement kills the process loudly.
++//
++// Transport: a shared-memory file (NINFER_TP_LOCKSTEP_FILE), not the NCCL communicator, so control
++// traffic never interleaves with the model's in-graph all-reduces. Rank 0 creates it; the
++// supervisor deletes it before (re)starting both ranks. Enabled only when NINFER_TP_RANK and
++// NINFER_TP_LOCKSTEP_FILE are both set.
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <span>
++#include <string>
++#include <thread>
++
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++namespace ninfer::runtime::tp {
++
++enum class UnitKind : std::uint64_t { Prefill = 1, Decode = 2 };
++
++struct alignas(64) Record {
++    std::uint64_t seq;
++    std::uint64_t kind;
++    std::uint64_t cancel_mask;
++    std::uint64_t count;
++    std::uint64_t hash;
++    std::uint64_t position;
++    std::uint64_t pad[2];
++};
++
++struct alignas(64) SharedBlock {
++    std::uint64_t magic;
++    std::uint64_t pad0[7];
++    std::atomic<std::uint64_t> published[2];  // last exchanged seq per rank
++    std::uint64_t pad1[6];
++    Record records[2][2];                     // [rank][seq & 1]
++};
++
++inline constexpr std::uint64_t kLockstepMagic = 0x4e494e4650325450ULL;  // "NINFP2TP"
++
++[[noreturn]] inline void lockstep_fatal(const std::string& what) {
++    std::fprintf(stderr, "[ninfer] TP2 LOCKSTEP FAILURE: %s\n", what.c_str());
++    std::fflush(stderr);
++    std::abort();
++}
++
++class Lockstep {
++  public:
++    static Lockstep* instance() {
++        static Lockstep* self = [] () -> Lockstep* {
++            const char* rank = std::getenv("NINFER_TP_RANK");
++            const char* path = std::getenv("NINFER_TP_LOCKSTEP_FILE");
++            if (rank == nullptr || path == nullptr) { return nullptr; }
++            return new Lockstep(std::atoi(rank), path);
++        }();
++        return self;
++    }
++
++    [[nodiscard]] int rank() const noexcept { return rank_; }
++
++    // Publishes this rank's view of the unit, waits for the peer's, verifies both describe the same
++    // unit and result, and returns the OR of both cancellation masks.
++    std::uint64_t exchange(UnitKind kind, std::uint64_t cancel_mask, std::uint64_t count,
++                           std::uint64_t hash, std::uint64_t position) {
++        const std::uint64_t seq = ++seq_;
++        if (fault_unit_ != 0 && seq == fault_unit_) { hash ^= 0x5a5a5a5aULL; }  // test hook
++        Record& mine            = block_->records[rank_][seq & 1];
++        mine = Record{seq, static_cast<std::uint64_t>(kind), cancel_mask, count, hash, position, {}};
++        block_->published[rank_].store(seq, std::memory_order_release);
++
++        const int peer = 1 - rank_;
++        const auto start = std::chrono::steady_clock::now();
++        std::uint32_t spins = 0;
++        for (;;) {
++            const std::uint64_t seen = block_->published[peer].load(std::memory_order_acquire);
++            if (seen == seq || seen == seq + 1) { break; }
++            if (seen > seq + 1) {
++                lockstep_fatal("peer is " + std::to_string(seen - seq) + " units ahead (seq " +
++                               std::to_string(seq) + ")");
++            }
++            if (++spins < 2048) { continue; }
++            if (std::chrono::steady_clock::now() - start > timeout_) {
++                lockstep_fatal("peer did not reach unit " + std::to_string(seq) + " within " +
++                               std::to_string(timeout_.count()) + " s");
++            }
++            std::this_thread::sleep_for(std::chrono::microseconds(20));
++        }
++        const Record theirs = block_->records[peer][seq & 1];
++        if (theirs.seq != seq || theirs.kind != mine.kind || theirs.count != mine.count ||
++            theirs.hash != mine.hash || theirs.position != mine.position) {
++            char buf[512];
++            std::snprintf(buf, sizeof(buf),
++                          "unit %llu diverged: kind %llu/%llu count %llu/%llu hash %016llx/%016llx "
++                          "position %llu/%llu (rank%d/peer)",
++                          static_cast<unsigned long long>(seq),
++                          static_cast<unsigned long long>(mine.kind),
++                          static_cast<unsigned long long>(theirs.kind),
++                          static_cast<unsigned long long>(mine.count),
++                          static_cast<unsigned long long>(theirs.count),
++                          static_cast<unsigned long long>(mine.hash),
++                          static_cast<unsigned long long>(theirs.hash),
++                          static_cast<unsigned long long>(mine.position),
++                          static_cast<unsigned long long>(theirs.position), rank_);
++            lockstep_fatal(buf);
++        }
++        return cancel_mask | theirs.cancel_mask;
++    }
++
++    template <class T>
++    static std::uint64_t hash_tokens(std::span<const T> tokens,
++                                     std::uint64_t h = 1469598103934665603ULL) noexcept {
++        for (const T t : tokens) {
++            h ^= static_cast<std::uint32_t>(t);
++            h *= 1099511628211ULL;
++        }
++        return h;
++    }
++
++  private:
++    Lockstep(int rank, const char* path) : rank_(rank) {
++        if (rank_ != 0 && rank_ != 1) { lockstep_fatal("NINFER_TP_RANK must be 0 or 1"); }
++        // Test hook: corrupt this rank's hash at the given unit to prove divergence is fatal.
++        if (const char* f = std::getenv("NINFER_TP_LOCKSTEP_FAULT_UNIT")) {
++            fault_unit_ = std::strtoull(f, nullptr, 10);
++        }
++        if (const char* t = std::getenv("NINFER_TP_LOCKSTEP_TIMEOUT_S")) {
++            timeout_ = std::chrono::seconds(std::atoi(t));
++        }
++        const std::size_t bytes = sizeof(SharedBlock);
++        int fd = -1;
++        if (rank_ == 0) {
++            fd = ::open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
++            if (fd < 0 || ::ftruncate(fd, static_cast<off_t>(bytes)) != 0) {
++                lockstep_fatal(std::string("cannot create ") + path);
++            }
++        } else {
++            const auto start = std::chrono::steady_clock::now();
++            for (;;) {
++                fd = ::open(path, O_RDWR);
++                struct stat st {};
++                if (fd >= 0 && ::fstat(fd, &st) == 0 && static_cast<std::size_t>(st.st_size) >= bytes) {
++                    break;
++                }
++                if (fd >= 0) { ::close(fd); fd = -1; }
++                if (std::chrono::steady_clock::now() - start > std::chrono::seconds(600)) {
++                    lockstep_fatal(std::string("timed out waiting for ") + path);
++                }
++                std::this_thread::sleep_for(std::chrono::milliseconds(50));
++            }
++        }
++        void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++        ::close(fd);
++        if (p == MAP_FAILED) { lockstep_fatal("mmap failed"); }
++        block_ = static_cast<SharedBlock*>(p);
++        if (rank_ == 0) {
++            std::memset(static_cast<void*>(block_), 0, bytes);
++            std::atomic_thread_fence(std::memory_order_seq_cst);
++            reinterpret_cast<std::atomic<std::uint64_t>*>(&block_->magic)
++                ->store(kLockstepMagic, std::memory_order_release);
++        } else {
++            const auto start = std::chrono::steady_clock::now();
++            while (reinterpret_cast<std::atomic<std::uint64_t>*>(&block_->magic)
++                       ->load(std::memory_order_acquire) != kLockstepMagic) {
++                if (std::chrono::steady_clock::now() - start > std::chrono::seconds(600)) {
++                    lockstep_fatal("rank 0 never initialised the lockstep block");
++                }
++                std::this_thread::sleep_for(std::chrono::milliseconds(50));
++            }
++        }
++        std::fprintf(stderr, "[ninfer] TP2 lockstep rank %d on %s (timeout %lld s)\n", rank_, path,
++                     static_cast<long long>(timeout_.count()));
++    }
++
++    int rank_;
++    std::uint64_t seq_ = 0;
++    std::uint64_t fault_unit_ = 0;
++    std::chrono::seconds timeout_{300};
++    SharedBlock* block_ = nullptr;
++};
++
++}  // namespace ninfer::runtime::tp
+diff --git a/src/targets/qwen3_6_27b_tp2/impl/tp2_comm.cpp b/src/targets/qwen3_6_27b_tp2/impl/tp2_comm.cpp
+index 2c51549..f040af3 100644
+--- a/src/targets/qwen3_6_27b_tp2/impl/tp2_comm.cpp
++++ b/src/targets/qwen3_6_27b_tp2/impl/tp2_comm.cpp
+@@ -1,4 +1,5 @@
+ #include "targets/qwen3_6_27b_tp2/impl/tp2_comm.h"
++#include "runtime/engine/tp_lockstep.h"
+ 
+ #include "core/device.h" // CUDA_CHECK
+ #include "ninfer/ops/residual_add.h"
+@@ -81,6 +82,8 @@ void init() {
+     g_comm = comm;
+     g_rank = rank;
+     std::fprintf(stderr, "[ninfer] TP2 rank %d/2 ready (NCCL %d)\n", rank, NCCL_VERSION_CODE);
++    // Create/attach the per-unit lockstep block now so both ranks agree on its lifetime.
++    (void)::ninfer::runtime::tp::Lockstep::instance();
+ }
+ 
+ int rank() { return g_rank; }
+diff --git a/tools/tp2/tp2_proxy.py b/tools/tp2/tp2_proxy.py
+new file mode 100644
+index 0000000..c92692f
+--- /dev/null
++++ b/tools/tp2/tp2_proxy.py
+@@ -0,0 +1,392 @@
++#!/usr/bin/env python3
++"""Front proxy + supervisor for two-process TP2 ninfer-serve (stdlib only).
++
++* Starts rank 0 and rank 1 (one GPU each), waits until both answer /v1/models.
++* Serialises generation requests; each request body is sent unchanged to both ranks. Rank 0's
++  response is relayed to the client; rank 1's is drained and discarded.
++* A client disconnect closes only the rank-0 upstream connection. The engines agree on
++  cancellation once per GPU unit (runtime/engine/tp_lockstep.h), so rank 1 stops at the same unit.
++* Watchdog: if either process exits, or a request is in flight and the lockstep unit counters do
++  not advance for --stall-seconds, both processes are killed and restarted and the client gets a
++  503 (or a closed stream if headers were already sent).
++"""
++import argparse, http.client, http.server, json, mmap, os, signal, socket, socketserver
++import struct, subprocess, sys, threading, time
++
++HOP = {"connection", "keep-alive", "transfer-encoding", "content-length", "te", "trailer",
++       "upgrade", "proxy-connection"}
++
++
++def log(msg):
++    print(time.strftime("%Y-%m-%d %H:%M:%S"), "[tp2-proxy]", msg, flush=True)
++
++
++class Supervisor:
++    def __init__(self, args):
++        self.args = args
++        self.procs = [None, None]
++        self.ready = threading.Event()
++        self.lock = threading.Lock()          # serialises generation requests
++        self.state_lock = threading.Lock()
++        self.generation = 0
++        self.restarts = 0
++        self.waiting = 0
++        self.count_lock = threading.Lock()
++
++    # ---- process management -------------------------------------------------------------
++    def rank_cmd(self, r):
++        a = self.args
++        return [a.binary, f"{a.model_prefix}.rank{r}.ninfer", "--host", "127.0.0.1",
++                "--port", str(a.rank_ports[r]), "--api-key", a.probe_key] + a.serve_args
++
++    def rank_env(self, r):
++        env = dict(os.environ)
++        env.update({"CUDA_VISIBLE_DEVICES": str(self.args.gpus[r]), "NINFER_TP_RANK": str(r),
++                    "NINFER_TP_ID_FILE": self.args.id_file,
++                    "NINFER_TP_LOCKSTEP_FILE": self.args.lockstep_file,
++                    "NINFER_TP_LOCKSTEP_TIMEOUT_S": str(self.args.lockstep_timeout),
++                    "NCCL_P2P_DISABLE": "1"})
++        if r == 1:
++            for kv in self.args.rank1_env:   # test hooks only
++                k, v = kv.split("=", 1)
++                env[k] = v
++        return env
++
++    def start(self):
++        with self.state_lock:
++            self.ready.clear()
++            for f in (self.args.id_file, self.args.id_file + ".tmp", self.args.lockstep_file):
++                try:
++                    os.unlink(f)
++                except FileNotFoundError:
++                    pass
++            self.generation += 1
++            for r in (0, 1):
++                logf = open(f"{self.args.log_dir}/tp2_rank{r}.log", "ab")
++                self.procs[r] = subprocess.Popen(self.rank_cmd(r), env=self.rank_env(r),
++                                                 stdout=logf, stderr=subprocess.STDOUT,
++                                                 stdin=subprocess.DEVNULL, start_new_session=True)
++            log(f"started ranks gen={self.generation} pids={[p.pid for p in self.procs]}")
++        deadline = time.time() + self.args.start_timeout
++        while time.time() < deadline:
++            if any(p.poll() is not None for p in self.procs):
++                log("a rank exited during startup")
++                return False
++            if all(self.probe(r) for r in (0, 1)):
++                log(f"both ranks ready gen={self.generation}")
++                self.ready.set()
++                return True
++            time.sleep(1)
++        log("startup timed out")
++        return False
++
++    def kill_all(self):
++        with self.state_lock:
++            for p in self.procs:
++                if p is not None and p.poll() is None:
++                    try:
++                        os.killpg(p.pid, signal.SIGKILL)
++                    except ProcessLookupError:
++                        pass
++            for p in self.procs:
++                if p is not None:
++                    try:
++                        p.wait(timeout=30)
++                    except subprocess.TimeoutExpired:
++                        pass
++
++    def restart(self, reason):
++        log(f"RESTART both ranks: {reason}")
++        self.restarts += 1
++        self.ready.clear()
++        self.kill_all()
++        time.sleep(2)
++        while not self.start():
++            self.kill_all()
++            time.sleep(10)
++
++    def probe(self, r):
++        try:
++            c = http.client.HTTPConnection("127.0.0.1", self.args.rank_ports[r], timeout=5)
++            c.request("GET", "/v1/models", headers={"Authorization": f"Bearer {self.args.probe_key}"})
++            ok = c.getresponse().status == 200
++            c.close()
++            return ok
++        except OSError:
++            return False
++
++    def alive(self):
++        return all(p is not None and p.poll() is None for p in self.procs)
++
++    # ---- lockstep progress ----------------------------------------------------------------
++    def units(self):
++        try:
++            with open(self.args.lockstep_file, "rb") as f:
++                mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
++                a, b = struct.unpack_from("<QQ", mm, 64)
++                mm.close()
++                return a, b
++        except (OSError, ValueError, struct.error):
++            return None
++
++
++class Handler(http.server.BaseHTTPRequestHandler):
++    protocol_version = "HTTP/1.1"
++    sup: Supervisor = None
++
++    def log_message(self, fmt, *a):
++        pass
++
++    def _error(self, code, msg):
++        body = json.dumps({"error": {"message": msg, "type": "tp2_proxy_error"}}).encode()
++        try:
++            self.send_response(code)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(body)))
++            self.send_header("Connection", "close")
++            self.end_headers()
++            self.wfile.write(body)
++        except OSError:
++            pass
++        self.close_connection = True
++
++    def _headers_in(self):
++        return {k: v for k, v in self.headers.items() if k.lower() not in HOP and k.lower() != "host"}
++
++    def do_GET(self):
++        self._passthrough("GET", None)
++
++    def do_DELETE(self):
++        self._passthrough("DELETE", None)
++
++    def _passthrough(self, method, body):
++        sup = self.sup
++        if not sup.ready.wait(timeout=sup.args.ready_wait):
++            return self._error(503, "TP2 backend is restarting")
++        try:
++            c = http.client.HTTPConnection("127.0.0.1", sup.args.rank_ports[0], timeout=60)
++            c.request(method, self.path, body=body, headers=self._headers_in())
++            r = c.getresponse()
++            data = r.read()
++            self.send_response(r.status)
++            for k, v in r.getheaders():
++                if k.lower() not in HOP:
++                    self.send_header(k, v)
++            self.send_header("Content-Length", str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++            c.close()
++        except OSError as e:
++            self._error(502, f"rank0 unreachable: {e}")
++
++    def do_POST(self):
++        sup = self.sup
++        n = int(self.headers.get("Content-Length") or 0)
++        body = self.rfile.read(n) if n else b""
++        if not sup.ready.wait(timeout=sup.args.ready_wait):
++            return self._error(503, "TP2 backend is restarting")
++        with sup.count_lock:
++            if sup.waiting >= sup.args.max_waiting + 1:
++                return self._error(429, "too many queued requests")
++            sup.waiting += 1
++        try:
++            if not sup.lock.acquire(timeout=sup.args.pending_timeout):
++                return self._error(503, "request expired while waiting for admission")
++            try:
++                if not sup.ready.is_set() or not sup.alive():
++                    return self._error(503, "TP2 backend is restarting")
++                self._generate(body)
++            finally:
++                sup.lock.release()
++        finally:
++            with sup.count_lock:
++                sup.waiting -= 1
++
++    def _generate(self, body):
++        sup = self.sup
++        gen = sup.generation
++        headers = self._headers_in()
++        headers["Content-Length"] = str(len(body))
++        conns = [http.client.HTTPConnection("127.0.0.1", sup.args.rank_ports[r], timeout=None)
++                 for r in (0, 1)]
++        for r in (0, 1):
++            conns[r].request("POST", self.path, body=body, headers=headers)
++        failure = {"reason": None}
++        done = [threading.Event(), threading.Event()]
++        upstream_socks = [conns[0].sock, conns[1].sock]
++
++        def drain_rank1():
++            try:
++                r1 = conns[1].getresponse()
++                while r1.read1(65536):
++                    pass
++            except (OSError, http.client.HTTPException) as e:
++                failure["reason"] = failure["reason"] or f"rank1 stream error: {e}"
++            finally:
++                done[1].set()
++
++        def watchdog():
++            last = sup.units()
++            last_t = time.time()
++            while not (done[0].is_set() and done[1].is_set()):
++                time.sleep(2)
++                if sup.generation != gen:
++                    return
++                if not sup.alive():
++                    failure["reason"] = failure["reason"] or "a rank process exited"
++                    break
++                u = sup.units()
++                if u != last:
++                    last, last_t = u, time.time()
++                elif time.time() - last_t > sup.args.stall_seconds:
++                    failure["reason"] = failure["reason"] or \
++                        f"no lockstep progress for {sup.args.stall_seconds}s (units {u})"
++                    break
++            if failure["reason"]:
++                for s in upstream_socks:
++                    try:
++                        s.shutdown(socket.SHUT_RDWR)
++                    except OSError:
++                        pass
++
++        cancel_state = {"client_gone": False}
++
++        def client_watch():
++            # A non-streaming client that times out is only noticed here: nothing is written to it
++            # until rank 0 finishes. EOF on the client socket cancels rank 0 immediately.
++            import select
++            sock = self.connection
++            while not done[0].is_set():
++                try:
++                    readable, _, _ = select.select([sock], [], [], 0.5)
++                    if readable and sock.recv(1, socket.MSG_PEEK) == b"":
++                        cancel_state["client_gone"] = True
++                        try:
++                            conns[0].sock.shutdown(socket.SHUT_RDWR)
++                        except OSError:
++                            pass
++                        return
++                except (OSError, ValueError):
++                    return
++
++        tc = threading.Thread(target=client_watch, daemon=True)
++        tc.start()
++        t1 = threading.Thread(target=drain_rank1, daemon=True)
++        tw = threading.Thread(target=watchdog, daemon=True)
++        t1.start(); tw.start()
++
++        headers_sent = False
++        client_gone = False
++        try:
++            r0 = conns[0].getresponse()
++            self.send_response(r0.status)
++            length = r0.getheader("Content-Length")
++            for k, v in r0.getheaders():
++                if k.lower() not in HOP:
++                    self.send_header(k, v)
++            if length is not None:
++                self.send_header("Content-Length", length)
++            else:
++                self.send_header("Connection", "close")
++                self.close_connection = True
++            self.end_headers()
++            headers_sent = True
++            while True:
++                chunk = r0.read1(65536)
++                if not chunk:
++                    break
++                if not client_gone:
++                    try:
++                        self.wfile.write(chunk)
++                        self.wfile.flush()
++                    except OSError:
++                        client_gone = True
++                        # Cancel on rank 0 only; lockstep carries it to rank 1.
++                        try:
++                            conns[0].sock.shutdown(socket.SHUT_RDWR)
++                        except OSError:
++                            pass
++                        break
++        except (OSError, http.client.HTTPException) as e:
++            client_gone = client_gone or cancel_state["client_gone"]
++            failure["reason"] = failure["reason"] or (None if client_gone else f"rank0 stream error: {e}")
++        finally:
++            done[0].set()
++
++        # Wait for rank 1 to finish the same request (bounded by the watchdog).
++        t1.join()
++        tw.join(timeout=5)
++        for c in conns:
++            c.close()
++        if client_gone:
++            log(f"client disconnected on {self.path}; rank0 cancelled")
++        if failure["reason"] and sup.generation == gen:
++            if not headers_sent:
++                self._error(503, f"TP2 backend failed: {failure['reason']}")
++            else:
++                self.close_connection = True
++            sup.restart(failure["reason"])
++
++
++class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
++    daemon_threads = True
++    allow_reuse_address = True
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--listen", default="127.0.0.1:18881")
++    ap.add_argument("--binary", required=True)
++    ap.add_argument("--model-prefix", required=True)
++    ap.add_argument("--rank-ports", default="18940,18941")
++    ap.add_argument("--gpus", default="0,1")
++    ap.add_argument("--id-file", default="/tmp/ninfer_tp2.id")
++    ap.add_argument("--lockstep-file", default="/dev/shm/ninfer_tp2_lockstep")
++    ap.add_argument("--lockstep-timeout", type=int, default=300)
++    ap.add_argument("--stall-seconds", type=int, default=180)
++    ap.add_argument("--start-timeout", type=int, default=900)
++    ap.add_argument("--ready-wait", type=int, default=600)
++    ap.add_argument("--api-key-file", required=True,
++                    help="bearer key: passed to both ranks and used for health probes")
++    ap.add_argument("--max-waiting", type=int, default=4,
++                    help="generation requests allowed to queue behind the running one")
++    ap.add_argument("--pending-timeout", type=int, default=600,
++                    help="seconds a queued generation request may wait")
++    ap.add_argument("--log-dir", default=".")
++    ap.add_argument("--rank1-env", action="append", default=[], help="KEY=VAL for rank 1 (tests)")
++    ap.add_argument("serve_args", nargs=argparse.REMAINDER)
++    a = ap.parse_args()
++    a.rank_ports = [int(x) for x in a.rank_ports.split(",")]
++    a.gpus = [int(x) for x in a.gpus.split(",")]
++    a.probe_key = open(a.api_key_file).read().strip()
++    if a.serve_args and a.serve_args[0] == "--":
++        a.serve_args = a.serve_args[1:]
++    sup = Supervisor(a)
++    Handler.sup = sup
++    host, port = a.listen.rsplit(":", 1)
++    srv = Server((host, int(port)), Handler)
++    threading.Thread(target=srv.serve_forever, daemon=True).start()
++    log(f"listening on {a.listen}")
++    while not sup.start():
++        sup.kill_all()
++        time.sleep(10)
++
++    def stop(*_):
++        log("shutting down")
++        sup.kill_all()
++        os._exit(0)
++    signal.signal(signal.SIGTERM, stop)
++    signal.signal(signal.SIGINT, stop)
++    # Idle watchdog: restart if a rank dies while no request holds the lock.
++    while True:
++        time.sleep(5)
++        if sup.ready.is_set() and not sup.alive() and sup.lock.acquire(blocking=False):
++            try:
++                if not sup.alive():
++                    sup.restart("a rank process exited while idle")
++            finally:
++                sup.lock.release()
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+

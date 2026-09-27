@@ -1,0 +1,50 @@
+From 78896253b2696a7e2cd3f29e38847fa232372bea Mon Sep 17 00:00:00 2001
+From: huangserva <huangserva@gmail.com>
+Date: Fri, 25 Sep 2026 23:58:50 +0800
+Subject: [PATCH 03/11] perf(sm70): retune D256 flash prompt attention for
+ Volta
+
+H24Kv4 prompt tile 32 -> 64 Q columns; ncols=64 config: 256 threads, 64-key
+batches, 64-wide K/V sub-batches. 131K/1024-token kernel 119.0 -> 88.6 ms
+(27.8 -> 37.4 TFLOP/s). Qwen3.8-27B nvfp4 with --prefill-chunk 2048:
+186K code prefill 455 -> 379 s, 193K zh 474 -> 392 s; decode unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ops/launcher/gqa_attention_volta_flash.cu | 3 ++-
+ third_party/llama_cpp_fattn/fattn-mma-f16.cuh | 4 +++-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/ops/launcher/gqa_attention_volta_flash.cu b/src/ops/launcher/gqa_attention_volta_flash.cu
+index cae90b5..c843581 100644
+--- a/src/ops/launcher/gqa_attention_volta_flash.cu
++++ b/src/ops/launcher/gqa_attention_volta_flash.cu
+@@ -57,8 +57,9 @@ struct VoltaFlashTiling;
+ 
+ template <>
+ struct VoltaFlashTiling<CausalD256H24Kv4> {
++    // 64-column Q tile (see the sm70 D256/ncols=64 entry in fattn-mma-f16.cuh).
+     static constexpr int ncols2 = 2;
+-    static constexpr int ncols1 = 16;
++    static constexpr int ncols1 = 32;
+ };
+ 
+ template <>
+diff --git a/third_party/llama_cpp_fattn/fattn-mma-f16.cuh b/third_party/llama_cpp_fattn/fattn-mma-f16.cuh
+index 4334051..d5e9f28 100644
+--- a/third_party/llama_cpp_fattn/fattn-mma-f16.cuh
++++ b/third_party/llama_cpp_fattn/fattn-mma-f16.cuh
+@@ -126,7 +126,9 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+     // genuine Volta entry above uses 64; giving 256/256 the same halves shared memory
+     // to 35,072 B and doubles occupancy to 2 blocks/SM, with no change in accuracy.
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128,  64, 1, false);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128,  64, 1, false);
++    // ninfer sm70 sweep (2026-09-25, 131K/1024-token prefill): 8 warps, 64-key batches and 64-wide
++    // K/V sub-batches took the D256 prompt kernel from 27.8 to 37.4 TFLOP/s on V100-PG500.
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1,  64,  64,  64,  64, 1, false);
+ 
+     // TODO tune specifically for Volta
+     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
+-- 
+2.43.0
+
