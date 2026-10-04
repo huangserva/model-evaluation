@@ -70,6 +70,12 @@ You are participating in a closed-book capability evaluation.
 - [30 份可见答案](./round2-results/sol-2026-08-29-answers.jsonl)
 - [机器可读分数与协议](./round2-results/sol-2026-08-29-scores.json)
 
+Strata + Qwen3.8-Flash-Next IQ3_S 的两轮补测：
+
+- [两轮历史参考榜与结果](./strata-iq3s-2026-10-04/README.md)
+- [31 份完整最终答卷](./strata-iq3s-2026-10-04/answers.jsonl)
+- [循环恢复补丁与验证](./strata-iq3s-2026-10-04/fix-verification.md)
+
 公开材料不包含私有评分表、参考答案、匿名映射、模型密钥或裁判原始备注；分数文件只公开私有评分规则的 SHA-256 哈希，用于校验评分规则是否发生变化。
 
 ## 二、每模型 300 题代码与困难推理基准
