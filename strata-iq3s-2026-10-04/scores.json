@@ -1,0 +1,226 @@
+{
+  "judge": "gpt-5.6-sol",
+  "requested_effort": "max",
+  "round1_total": 94.0,
+  "round1_incomplete": false,
+  "round2_total": 96.8,
+  "round2_dimensions": {
+    "D1": {
+      "scores": [
+        10,
+        10,
+        10
+      ],
+      "median": 10,
+      "range": [
+        10,
+        10
+      ]
+    },
+    "D2": {
+      "scores": [
+        10,
+        9.2,
+        10
+      ],
+      "median": 10,
+      "range": [
+        9.2,
+        10
+      ]
+    },
+    "D3": {
+      "scores": [
+        8.8,
+        9.6,
+        9.6
+      ],
+      "median": 9.6,
+      "range": [
+        8.8,
+        9.6
+      ]
+    },
+    "D4": {
+      "scores": [
+        9.6,
+        9.2,
+        9.6
+      ],
+      "median": 9.6,
+      "range": [
+        9.2,
+        9.6
+      ]
+    },
+    "D5": {
+      "scores": [
+        9.6,
+        9.2,
+        9.2
+      ],
+      "median": 9.2,
+      "range": [
+        9.2,
+        9.6
+      ]
+    },
+    "D6": {
+      "scores": [
+        10,
+        9.6,
+        10
+      ],
+      "median": 10,
+      "range": [
+        9.6,
+        10
+      ]
+    },
+    "D7": {
+      "scores": [
+        8.4,
+        8.8,
+        8.8
+      ],
+      "median": 8.8,
+      "range": [
+        8.4,
+        8.8
+      ]
+    },
+    "D8": {
+      "scores": [
+        10,
+        9.6,
+        10
+      ],
+      "median": 10,
+      "range": [
+        9.6,
+        10
+      ]
+    },
+    "D9": {
+      "scores": [
+        9.6,
+        9.6,
+        9.2
+      ],
+      "median": 9.6,
+      "range": [
+        9.2,
+        9.6
+      ]
+    },
+    "D10": {
+      "scores": [
+        9.6,
+        10,
+        10
+      ],
+      "median": 10,
+      "range": [
+        9.6,
+        10
+      ]
+    }
+  },
+  "rubrics": {
+    "1": "0eaeec7201981740b45c9edef0a4a39186438c713489928a4f153598632fbd64",
+    "2": "083fee4b32835fc32b36901c494c1581e3c358554b7aa9632bd0c4119838bc5c"
+  },
+  "limitations": "Fixed configuration regression is a separate 64K cohort. Historical judges/settings differ; candidate answers are not rerun or selected by the judge.",
+  "verification": {
+    "original_tasks": 31,
+    "complete_natural_answers": 31,
+    "empty": 0,
+    "truncated": 0,
+    "literal_loops_in_returned_trace": 0,
+    "recovered_requests": [
+      {
+        "id": "round2-D2-run1",
+        "recoveries": 1,
+        "repeat_coverage": 0.329
+      },
+      {
+        "id": "round2-D2-run3",
+        "recoveries": 1,
+        "repeat_coverage": 0.257
+      },
+      {
+        "id": "round2-D2-run2",
+        "recoveries": 1,
+        "repeat_coverage": 0.265
+      },
+      {
+        "id": "round2-D3-run3",
+        "recoveries": 1,
+        "repeat_coverage": 0.278
+      }
+    ],
+    "round1_total": 94.0,
+    "round2_total": 96.8,
+    "rubric_b0_count": 0,
+    "existing_unit_tests_passed": 118,
+    "new_unit_tests_passed": 7,
+    "prompts_and_seeds_preserved": true,
+    "original_model_weights_and_tokenizer_configuration_preserved": true,
+    "independent_thinking_budget": null,
+    "synthetic_thinking_closure": false,
+    "extra_task_prompts_or_corrections": false,
+    "cohort_source_sha256": "0697baaadd18c545c3d667eb911f9629fc85014d7d8f5857f2e3902fdc82520f",
+    "cohort_sampler_identity_under_deployed_recovery": true,
+    "paired_failure_prefix_replay": {
+      "control_has_literal_loop": true,
+      "control_phrase_repetitions": 1487,
+      "control_max_consecutive_repeats": 1487,
+      "repair_finish": "stop",
+      "repair_completion_tokens": 6655,
+      "repair_final_nonempty": true,
+      "repair_recoveries": 1,
+      "repair_phrase_count": 187,
+      "repair_final_sha256": "44bdb418b8003bde65195b6af9f67fe20353ed50324882973f20dbe2a0e75bba",
+      "passed": true,
+      "at": 1791131344.9009414
+    },
+    "paired_original_D2": {
+      "id": "round2-D2-run3",
+      "same_original_messages": true,
+      "same_seed": true,
+      "same_sampling": true,
+      "same_cap": true,
+      "common_reasoning_prefix_chars": 138470,
+      "common_reasoning_sha256": "a545a0845aa4f1a942570fd4b9f0db9872e373e2b4f59063918b48bb41829d30",
+      "before_finish": "length",
+      "before_empty": true,
+      "before_tokens": 65536,
+      "after_finish": "stop",
+      "after_tokens": 60955,
+      "after_nonempty": true
+    },
+    "paired_literal_replay_output_cap": 16384,
+    "paired_literal_replay_original_numeric_path": true,
+    "strict_numeric_replay": {
+      "control_has_literal_loop": false,
+      "control_phrase_repetitions": 0,
+      "control_max_consecutive_repeats": 1,
+      "repair_finish": "stop",
+      "repair_completion_tokens": 10568,
+      "repair_final_nonempty": true,
+      "repair_recoveries": 1,
+      "repair_phrase_count": 0,
+      "repair_final_sha256": "b8e4d73214fb30f8a76c21d045a321e64553cd13d5472e38ec6af936e0e6f642",
+      "passed": false,
+      "at": 1791130426.1574452
+    },
+    "source_sha256": "84bfcd2df1fdc66fa47cd8f5d88dc332fb0e096bb0ca0f257051d675f4a02fbf"
+  },
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "presence_penalty": 1.5
+  },
+  "reasoning_effort": "xhigh; switches native hint to low after repeated reasoning"
+}
